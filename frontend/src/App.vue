@@ -20,6 +20,13 @@ const history = ref(JSON.parse(localStorage.getItem('paperpolish_history_v2') ||
 const toast = reactive({ show:false, message:'', type:'info' })
 let toastTimer
 
+const finalEngine = ref(localStorage.getItem('paperpolish_final_engine_v1') || 'local')
+const remoteApiKey = ref(localStorage.getItem('paperpolish_remote_api_key_v1') || '')
+const remoteModel = ref(localStorage.getItem('paperpolish_remote_model_v1') || '')
+const remoteModels = ref([])
+const remoteModelsLoading = ref(false)
+const showApiKey = ref(false)
+
 const modelStatus = reactive({ ready:false, model:'tencent/Hy-MT2-7B', status:'checking', downloaded:false, dtype:'bfloat16', lastLoadSeconds:null, lastError:'', gpu:null })
 
 const glossaryGroups = ref([])
@@ -62,6 +69,7 @@ const activeTerms = computed(() => glossaryTerms.value.filter(t => selectedGloss
 const selectedTermCount = computed(() => activeTerms.value.length)
 const selectedGroup = computed(() => glossaryGroups.value.find(g=>g.id===selectedGroupId.value) || null)
 const selectedGroupTerms = computed(() => glossaryTerms.value.filter(t=>t.groupId===selectedGroupId.value))
+const finalEngineLabel = computed(() => finalEngine.value==='remote' ? (remoteModel.value || 'API') : 'Hy-MT2-7B')
 
 watch([source,chinese,finalEnglish],()=>localStorage.setItem('paperpolish_draft_v2',JSON.stringify({source:source.value,chinese:chinese.value,finalEnglish:finalEnglish.value})))
 watch(history,v=>localStorage.setItem('paperpolish_history_v2',JSON.stringify(v)),{deep:true})
@@ -70,6 +78,9 @@ watch(mode,v=>localStorage.setItem('paperpolish_mode_v1',v))
 watch(formatType,v=>localStorage.setItem('paperpolish_format_v1',v))
 watch(preferencesText,v=>localStorage.setItem('paperpolish_preferences_v1',v))
 watch(backgroundText,v=>localStorage.setItem('paperpolish_background_v1',v))
+watch(finalEngine,v=>localStorage.setItem('paperpolish_final_engine_v1',v))
+watch(remoteApiKey,v=>localStorage.setItem('paperpolish_remote_api_key_v1',v))
+watch(remoteModel,v=>localStorage.setItem('paperpolish_remote_model_v1',v))
 watch(glossaryGroups,v=>localStorage.setItem('paperpolish_glossary_groups_v3',JSON.stringify(v)),{deep:true})
 watch(glossaryTerms,v=>localStorage.setItem('paperpolish_glossary_terms_v3',JSON.stringify(v)),{deep:true})
 watch(selectedGlossaryIds,v=>localStorage.setItem('paperpolish_selected_glossaries_v3',JSON.stringify(v)),{deep:true})
@@ -151,20 +162,48 @@ function openGlossaryManager(groupId=''){
 }
 function backToWorkspace(){ activeView.value='workspace' }
 
+async function fetchRemoteModels(){
+  if(!remoteApiKey.value.trim()){notify('请先填写 API Key','warning');return}
+  remoteModelsLoading.value=true
+  try{
+    const response=await fetch('/api/remote/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:remoteApiKey.value.trim()})})
+    const data=await response.json(); if(!response.ok)throw new Error(data.detail||'获取模型失败')
+    remoteModels.value=data.models||[]
+    if(!remoteModel.value && remoteModels.value.length) remoteModel.value=remoteModels.value[0]
+    notify(`已获取 ${remoteModels.value.length} 个可用模型`,'success')
+  }catch(error){notify(error.message,'error')}finally{remoteModelsLoading.value=false}
+}
+
 async function callApi(direction){
   const text=direction==='en-zh'?source.value.trim():chinese.value.trim()
   if(!text){notify(direction==='en-zh'?'先粘贴英文原文':'先完成中文修改','warning');return}
-  if(!modelStatus.ready){notify('请先加载 Hy-MT2-7B 模型','warning');showModelManager.value=true;showSidebar.value=true;activeTool.value='model';return}
+
+  const useRemote=direction==='zh-en' && finalEngine.value==='remote'
+  if(useRemote){
+    if(!remoteApiKey.value.trim()){notify('请先在翻译设置中填写 API Key','warning');openTool('settings');return}
+    if(!remoteModel.value.trim()){notify('请选择或填写 API 模型','warning');openTool('settings');return}
+  }else if(!modelStatus.ready){
+    notify('请先加载 Hy-MT2-7B 模型','warning');showModelManager.value=true;showSidebar.value=true;activeTool.value='model';return
+  }
+
   loading.value=direction
   try{
-    const response=await fetch('/api/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      text,direction,mode:mode.value,terms:activeTerms.value.map(({english,chinese,type})=>({english,chinese,type})),original_english:source.value,style:style.value,
-      preferences:preferencesText.value.split('\n').map(v=>v.trim()).filter(Boolean),format_type:formatType.value,background_text:backgroundText.value,
-    })})
+    let response
+    if(useRemote){
+      response=await fetch('/api/remote/polish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        text,api_key:remoteApiKey.value.trim(),model:remoteModel.value.trim(),original_english:source.value,style:style.value,
+        terms:activeTerms.value.map(({english,chinese,type})=>({english,chinese,type})),
+      })})
+    }else{
+      response=await fetch('/api/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        text,direction,mode:mode.value,terms:activeTerms.value.map(({english,chinese,type})=>({english,chinese,type})),original_english:source.value,style:style.value,
+        preferences:preferencesText.value.split('\n').map(v=>v.trim()).filter(Boolean),format_type:formatType.value,background_text:backgroundText.value,
+      })})
+    }
     const data=await response.json(); if(!response.ok)throw new Error(data.detail||'请求失败')
     if(direction==='en-zh'){chinese.value=data.result;activeStage.value='chinese';notify('中文初稿已生成','success')}
-    else{finalEnglish.value=data.result;activeStage.value='final';notify('学术英文已生成','success')}
-    await checkHealth()
+    else{finalEnglish.value=data.result;activeStage.value='final';notify(useRemote?`已通过 ${remoteModel.value} 生成学术英文`:'学术英文已生成','success')}
+    if(!useRemote) await checkHealth()
   }catch(error){notify(error.message,'error')}finally{loading.value=''}
 }
 function saveParagraph(){
@@ -215,7 +254,28 @@ onMounted(()=>{
         <div class="sidebar-content">
           <section v-if="activeTool==='settings'" class="tool-panel">
             <div class="tool-heading"><div><span class="eyebrow">TRANSLATION</span><h2>翻译设置</h2></div><button class="close-mobile" @click="showSidebar=false">×</button></div>
-            <label class="field-label">模式</label>
+
+            <div class="engine-settings-card">
+              <div class="engine-settings-head"><div><span class="field-kicker">FINAL ENGLISH</span><strong>最终英文引擎</strong></div><span class="engine-current">{{ finalEngineLabel }}</span></div>
+              <div class="engine-switch">
+                <button :class="{active:finalEngine==='local'}" @click="finalEngine='local'"><b>本地</b><small>Hy-MT2-7B</small></button>
+                <button :class="{active:finalEngine==='remote'}" @click="finalEngine='remote'"><b>API</b><small>api.gpt.ge</small></button>
+              </div>
+              <p class="helper engine-helper">英文原文 → 中文始终使用 Hy-MT2；这里仅控制“中文修改 → 最终英文”。</p>
+
+              <div v-if="finalEngine==='remote'" class="remote-settings">
+                <div class="remote-host-row"><span>API Host</span><code>https://api.gpt.ge</code></div>
+                <label class="field-label">API Key <span>仅保存在当前浏览器</span></label>
+                <div class="secret-input-wrap"><input v-model="remoteApiKey" :type="showApiKey?'text':'password'" class="control" autocomplete="off" placeholder="sk-..."/><button @click="showApiKey=!showApiKey">{{ showApiKey?'隐藏':'显示' }}</button></div>
+                <label class="field-label">模型</label>
+                <input v-model="remoteModel" list="remote-model-options" class="control" placeholder="填写或从 Key 获取可用模型"/>
+                <datalist id="remote-model-options"><option v-for="item in remoteModels" :key="item" :value="item"/></datalist>
+                <button class="btn secondary wide fetch-models-btn" :disabled="remoteModelsLoading" @click="fetchRemoteModels">{{ remoteModelsLoading?'正在读取模型…':'从 API Key 获取可用模型' }}</button>
+                <p class="remote-security-note">Key 只由浏览器发送给你自己的 PaperPolish 后端，后端不会把它写入磁盘。</p>
+              </div>
+            </div>
+
+            <label class="field-label">Hy-MT2 翻译模式</label>
             <select v-model="mode" class="control"><option value="paper">PaperPolish 论文模式（推荐）</option><option value="default">Default Translation</option><option value="terminology">Terminology</option><option value="style">Style</option><option value="personalization">Personalization</option><option value="delimiters">Delimiters</option><option value="structured-data-1">Structured Data 1</option><option value="structured-data-2">Structured Data 2</option></select>
             <p class="helper">{{ modeHelp }}</p>
 
@@ -265,10 +325,10 @@ onMounted(()=>{
         <div class="mobile-stage-tabs"><button :class="{active:activeStage==='source'}" @click="activeStage='source'">英文原文</button><button :class="{active:activeStage==='chinese'}" @click="activeStage='chinese'">中文修改</button><button :class="{active:activeStage==='final'}" @click="activeStage='final'">最终英文</button></div>
         <section class="editor-grid">
           <article :class="['editor-card',{mobileHidden:activeStage!=='source'}]"><div class="editor-topline"><div><span class="stage-number">01</span><span><strong>英文原文</strong><small>Meaning anchor</small></span></div><button class="text-action" @click="copy(source)">复制</button></div><textarea v-model="source" placeholder="粘贴需要润色的英文论文段落…"></textarea><div class="editor-bottom"><span>{{ sourceWords }} words</span><button class="btn primary action-button" :disabled="loading||modelAction" @click="callApi('en-zh')">{{ loading==='en-zh'?'翻译中…':'翻译为中文' }} <b>→</b></button></div></article>
-          <article :class="['editor-card','chinese-card',{mobileHidden:activeStage!=='chinese'}]"><div class="editor-topline"><div><span class="stage-number">02</span><span><strong>中文修改</strong><small>Your intended meaning</small></span></div><button class="text-action" @click="copy(chinese)">复制</button></div><textarea v-model="chinese" placeholder="先确保中文准确表达你的真实意图，再生成最终英文。"></textarea><div class="editor-bottom"><span>{{ chineseChars }} 字</span><button class="btn primary action-button" :disabled="loading||modelAction" @click="callApi('zh-en')">{{ loading==='zh-en'?'生成中…':'生成学术英文' }} <b>→</b></button></div></article>
-          <article :class="['editor-card',{mobileHidden:activeStage!=='final'}]"><div class="editor-topline"><div><span class="stage-number">03</span><span><strong>最终英文</strong><small>Academic output</small></span></div><button class="text-action" @click="copy(finalEnglish)">复制</button></div><textarea v-model="finalEnglish" placeholder="最终学术英文会出现在这里…"></textarea><div class="editor-bottom"><span>{{ finalWords }} words</span><button class="btn secondary action-button" :disabled="loading||modelAction" @click="callApi('zh-en')">重新生成</button></div></article>
+          <article :class="['editor-card','chinese-card',{mobileHidden:activeStage!=='chinese'}]"><div class="editor-topline"><div><span class="stage-number">02</span><span><strong>中文修改</strong><small>Your intended meaning</small></span></div><button class="text-action" @click="copy(chinese)">复制</button></div><textarea v-model="chinese" placeholder="先确保中文准确表达你的真实意图，再生成最终英文。"></textarea><div class="editor-bottom"><span>{{ chineseChars }} 字</span><button class="btn primary action-button" :disabled="loading||modelAction" @click="callApi('zh-en')">{{ loading==='zh-en'?'生成中…':finalEngine==='remote'?'API 生成英文':'生成学术英文' }} <b>→</b></button></div></article>
+          <article :class="['editor-card',{mobileHidden:activeStage!=='final'}]"><div class="editor-topline"><div><span class="stage-number">03</span><span><strong>最终英文</strong><small>{{ finalEngine==='remote' ? `API · ${remoteModel||'未选模型'}` : 'Local · Hy-MT2-7B' }}</small></span></div><button class="text-action" @click="copy(finalEnglish)">复制</button></div><textarea v-model="finalEnglish" placeholder="最终学术英文会出现在这里…"></textarea><div class="editor-bottom"><span>{{ finalWords }} words</span><button class="btn secondary action-button" :disabled="loading||modelAction" @click="callApi('zh-en')">重新生成</button></div></article>
         </section>
-        <div class="workspace-hint"><span>◆</span><p>本次翻译已启用 <strong>{{ selectedGlossaryIds.length }}</strong> 个术语库，共 <strong>{{ selectedTermCount }}</strong> 个术语。<button class="inline-link" @click="openTool('settings')">修改选择</button></p></div>
+        <div class="workspace-hint"><span>◆</span><p>本次翻译已启用 <strong>{{ selectedGlossaryIds.length }}</strong> 个术语库，共 <strong>{{ selectedTermCount }}</strong> 个术语；最终英文使用 <strong>{{ finalEngineLabel }}</strong>。<button class="inline-link" @click="openTool('settings')">修改设置</button></p></div>
       </main>
     </div>
 
