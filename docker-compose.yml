@@ -10,7 +10,7 @@ services:
       MODEL_DIR: /models/Hy-MT2-7B
       MODEL_DTYPE: ${MODEL_DTYPE:-bfloat16}
       MAX_NEW_TOKENS: ${MAX_NEW_TOKENS:-4096}
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
     volumes:
       - ./models:/models
     ports:
