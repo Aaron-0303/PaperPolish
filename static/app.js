@@ -28,7 +28,7 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.remove("show"), 2200);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 2600);
 }
 
 function getJSON(key, fallback) {
@@ -58,9 +58,73 @@ function updateCounts() {
   finalCount.textContent = `${countWords(finalText.value)} words`;
 }
 
+function tokenizeForDiff(text) {
+  return text.match(/\s+|[A-Za-z0-9_]+(?:[-'][A-Za-z0-9_]+)*|\\[A-Za-z]+(?:\{[^{}]*\})?|[^\s]/g) || [];
+}
+
+function buildDiff(original, revised) {
+  const a = tokenizeForDiff(original);
+  const b = tokenizeForDiff(revised);
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+
+  // Paragraph-sized inputs are expected. Avoid allocating an excessive matrix
+  // if somebody pastes a whole paper: fall back to plain text instead.
+  if (a.length * b.length > 250000) {
+    return {
+      left: `<span>${escapeHTML(original || "暂无内容")}</span>`,
+      right: `<span>${escapeHTML(revised || "暂无内容")}</span>`,
+      limited: true,
+    };
+  }
+
+  const dp = Array.from({ length: rows }, () => new Uint16Array(cols));
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const left = [];
+  const right = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      const token = escapeHTML(a[i]);
+      left.push(token);
+      right.push(token);
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      left.push(`<del>${escapeHTML(a[i])}</del>`);
+      i += 1;
+    } else {
+      right.push(`<ins>${escapeHTML(b[j])}</ins>`);
+      j += 1;
+    }
+  }
+  while (i < a.length) left.push(`<del>${escapeHTML(a[i++])}</del>`);
+  while (j < b.length) right.push(`<ins>${escapeHTML(b[j++])}</ins>`);
+
+  return {
+    left: left.join("") || "暂无内容",
+    right: right.join("") || "暂无内容",
+    limited: false,
+  };
+}
+
 function updateDiff() {
-  $("diffOriginal").textContent = sourceText.value.trim() || "暂无内容";
-  $("diffFinal").textContent = finalText.value.trim() || "暂无内容";
+  const diff = buildDiff(sourceText.value.trim(), finalText.value.trim());
+  $("diffOriginal").innerHTML = diff.left;
+  $("diffFinal").innerHTML = diff.right;
+  const notice = $("diffNotice");
+  if (notice) {
+    notice.hidden = !diff.limited;
+    notice.textContent = diff.limited ? "文本过长，已关闭词级高亮以避免浏览器卡顿。" : "";
+  }
 }
 
 function saveDraft() {
@@ -83,7 +147,7 @@ function loadDraft() {
 }
 
 function escapeHTML(value) {
-  return value.replace(/[&<>'"]/g, (char) => ({
+  return String(value).replace(/[&<>'"]/g, (char) => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -110,6 +174,13 @@ function renderTerms() {
   `).join("");
 }
 
+function formatSavedAt(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
 function renderHistory() {
   const history = getHistory();
   if (!history.length) {
@@ -119,8 +190,11 @@ function renderHistory() {
   historyList.innerHTML = history.map((item, index) => `
     <div class="history-item">
       <div class="history-item-top">
-        <button class="text-button" data-load-history="${index}">恢复</button>
-        <button class="remove-button" data-remove-history="${index}">删除</button>
+        <span class="history-time">${escapeHTML(formatSavedAt(item.savedAt))}</span>
+        <div class="history-actions">
+          <button class="text-button" data-load-history="${index}">恢复</button>
+          <button class="remove-button" data-remove-history="${index}">删除</button>
+        </div>
       </div>
       <div class="history-preview">${escapeHTML((item.source || item.chinese || "空段落").slice(0, 120))}</div>
     </div>
@@ -205,6 +279,9 @@ function saveParagraph() {
 }
 
 function clearWorkspace() {
+  if ([sourceText.value, chineseText.value, finalText.value].some((v) => v.trim())) {
+    saveParagraph();
+  }
   sourceText.value = "";
   chineseText.value = "";
   finalText.value = "";
@@ -235,6 +312,14 @@ function saveTerm() {
     return;
   }
   const terms = getTerms();
+  const duplicate = terms.some((item) =>
+    (english && (item.english || "").toLowerCase() === english.toLowerCase()) ||
+    (chinese && item.chinese === chinese)
+  );
+  if (duplicate) {
+    showToast("术语库中已有相同术语");
+    return;
+  }
   terms.push({ english, chinese, type });
   setJSON(STORAGE_KEYS.terms, terms);
   renderTerms();
@@ -297,6 +382,14 @@ termModal.addEventListener("click", (event) => {
   if (event.target === termModal) closeTermModal();
 });
 
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !termModal.hidden) closeTermModal();
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    saveParagraph();
+  }
+});
+
 document.addEventListener("click", async (event) => {
   const navItem = event.target.closest(".nav-item");
   if (navItem) {
@@ -307,10 +400,15 @@ document.addEventListener("click", async (event) => {
   const copyButton = event.target.closest("[data-copy]");
   if (copyButton) {
     const target = $(copyButton.dataset.copy);
+    if (!target.value) {
+      showToast("没有可复制的内容");
+      return;
+    }
     try {
       await navigator.clipboard.writeText(target.value);
       showToast("已复制");
     } catch {
+      target.focus();
       target.select();
       document.execCommand("copy");
       showToast("已复制");
