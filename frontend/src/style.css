@@ -43,6 +43,8 @@ button { cursor: pointer; }
 .panel-title { margin-bottom: 8px; font-size: 13px; font-weight: 700; }
 .panel input, .panel select, .style-input { width: 100%; margin-bottom: 8px; padding: 9px 10px; border: 1px solid #d7dbe0; border-radius: 8px; background: #fff; }
 .style-input { min-height: 100px; resize: vertical; }
+.mode-help { margin: -1px 0 10px; color: #727781; font-size: 11px; line-height: 1.5; }
+.field-caption { margin: 9px 0 6px; color: #50555d; font-size: 11px; font-weight: 600; }
 .term-item, .history-item { margin-top: 8px; padding: 10px; border: 1px solid #e3e6ea; border-radius: 8px; background: #fafbfc; font-size: 12px; }
 .term-item div { display: flex; justify-content: space-between; gap: 8px; }
 .term-item span, .term-item small { color: #727781; }
