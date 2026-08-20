@@ -14,7 +14,7 @@ services:
     volumes:
       - ./models:/models
     ports:
-      - "8000:8000"
+      - "30480:8000"
     shm_size: "8gb"
 
   frontend:
@@ -25,4 +25,4 @@ services:
     depends_on:
       - backend
     ports:
-      - "30330:80"
+      - "30430:80"
