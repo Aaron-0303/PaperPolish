@@ -2,9 +2,8 @@ import gc
 import os
 import re
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock
 from typing import Literal
 
 import httpx
@@ -26,8 +25,8 @@ _tokenizer = None
 _model = None
 _model_lock = Lock()
 _infer_lock = Lock()
-_model_state = "loading_cpu"
-_model_message = "正在从本地磁盘加载模型到内存"
+_model_state = "unloaded"
+_model_message = "本地权重已就绪，点击后直接加载到 GPU"
 _last_error = ""
 _last_load_seconds = None
 
@@ -102,73 +101,49 @@ def model_on_gpu():
     return model_device().startswith("cuda")
 
 
-def load_model_cpu():
-    global _tokenizer, _model, _model_state, _model_message, _last_error, _last_load_seconds
-    with _model_lock:
-        if _model is not None:
-            if model_on_gpu():
-                _model_state = "gpu_ready"
-                _model_message = "模型已在显存中"
-            else:
-                _model_state = "cpu_ready"
-                _model_message = "模型已加载到内存"
-            return
-
-        _model_state = "loading_cpu"
-        _model_message = "正在从本地磁盘加载模型到内存"
-        _last_error = ""
-        started = time.perf_counter()
-        try:
-            ensure_model_files()
-            _tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
-            _model = AutoModelForCausalLM.from_pretrained(
-                str(MODEL_DIR),
-                dtype=torch_dtype(),
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-            )
-            _model.eval()
-            _last_load_seconds = round(time.perf_counter() - started, 2)
-            _model_state = "cpu_ready"
-            _model_message = "模型已加载到内存，可按需加载到 GPU"
-        except Exception as exc:
-            _tokenizer = None
-            _model = None
-            _model_state = "error"
-            _model_message = "模型加载到内存失败"
-            _last_error = str(exc)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(f"PaperPolish model CPU load failed: {type(exc).__name__}: {exc}")
-
-
 def load_model_gpu():
-    global _model_state, _model_message, _last_error, _last_load_seconds
-    if _model is None or _tokenizer is None:
-        if _model_state == "loading_cpu":
-            raise RuntimeError("模型正在从磁盘加载到内存，请稍后再试。")
-        raise RuntimeError("模型尚未加载到内存，请检查模型状态。")
+    global _tokenizer, _model, _model_state, _model_message, _last_error, _last_load_seconds
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA 不可用，无法加载模型到 GPU。")
 
     with _model_lock:
-        if model_on_gpu():
+        if _model is not None and model_on_gpu():
             _model_state = "gpu_ready"
             _model_message = "模型已在显存中"
             return
+
         _model_state = "loading_gpu"
-        _model_message = "正在将模型从内存加载到显存"
+        _model_message = "正在加载模型到 GPU"
         _last_error = ""
         started = time.perf_counter()
         try:
+            ensure_model_files()
+            if _tokenizer is None:
+                _tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+
+            if _model is None:
+                # First load: do not preload and retain a CPU copy at service startup.
+                # The user action performs the complete disk -> model -> GPU transition.
+                _model = AutoModelForCausalLM.from_pretrained(
+                    str(MODEL_DIR),
+                    dtype=torch_dtype(),
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                )
+
             _model.to("cuda")
             _model.eval()
             _last_load_seconds = round(time.perf_counter() - started, 2)
             _model_state = "gpu_ready"
             _model_message = "模型已在显存中，可以开始翻译"
         except Exception as exc:
-            _model_state = "cpu_ready" if _model is not None else "error"
-            _model_message = "模型加载到 GPU 失败"
+            # Keep an already-created CPU model reusable if GPU transfer failed.
+            if _model is not None and not model_on_gpu():
+                _model_state = "cpu_ready"
+                _model_message = "模型位于 CPU 内存，加载到 GPU 失败"
+            else:
+                _model_state = "error"
+                _model_message = "模型加载到 GPU 失败"
             _last_error = str(exc)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -183,7 +158,7 @@ def offload_model_cpu():
     with _model_lock:
         if not model_on_gpu():
             _model_state = "cpu_ready"
-            _model_message = "模型已在内存中"
+            _model_message = "模型已在 CPU 内存中"
             return
         _model_state = "offloading_cpu"
         _model_message = "正在将模型从显存卸载到内存"
@@ -197,7 +172,7 @@ def offload_model_cpu():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
             _model_state = "cpu_ready"
-            _model_message = "模型已卸载到内存，GPU 显存已释放"
+            _model_message = "模型已卸载到 CPU 内存，GPU 显存已释放"
         except Exception as exc:
             _model_state = "error"
             _model_message = "模型卸载到内存失败"
@@ -325,9 +300,9 @@ def build_prompt(req: TranslateRequest, protected: str) -> str:
 
 def generate(prompt: str) -> str:
     if _model is None or _tokenizer is None:
-        raise RuntimeError("模型尚未加载到内存。")
+        raise RuntimeError("模型尚未加载，请先在模型管理中加载模型。")
     if not model_on_gpu() or _model_state != "gpu_ready":
-        raise RuntimeError("模型当前位于 CPU 内存，请先在模型管理中点击“加载到 GPU”。")
+        raise RuntimeError("模型当前位于 CPU 内存，请先在模型管理中加载到 GPU。")
     device = model_device()
     inputs = _tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
@@ -434,14 +409,7 @@ def remote_polish(req: RemotePolishRequest):
         raise HTTPException(status_code=502, detail=f"远程 API 请求失败: {exc}") from exc
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    loader = Thread(target=load_model_cpu, name="paperpolish-model-loader", daemon=True)
-    loader.start()
-    yield
-
-
-app = FastAPI(title="PaperPolish API", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="PaperPolish API", version="0.7.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -487,7 +455,7 @@ def api_offload_model_cpu():
         raise HTTPException(status_code=500, detail=f"模型卸载到内存失败: {exc}") from exc
 
 
-# Backward-compatible aliases for the existing Vue frontend.
+# Backward-compatible aliases for the current Vue frontend.
 @app.post("/api/model/load")
 def api_load_model_compat():
     return api_load_model_gpu()
@@ -511,7 +479,7 @@ def api_remote_polish(req: RemotePolishRequest):
 @app.post("/api/translate")
 def translate(req: TranslateRequest):
     if _model is None:
-        raise HTTPException(status_code=409, detail="Hy-MT2-7B 正在加载到内存，请稍后查看模型状态。")
+        raise HTTPException(status_code=409, detail="Hy-MT2-7B 尚未加载，请先在模型管理中加载到 GPU。")
     if not model_on_gpu() or _model_state != "gpu_ready":
         raise HTTPException(status_code=409, detail="Hy-MT2-7B 当前位于 CPU 内存，请先在模型管理中加载到 GPU。")
     protected, replacements = protect_text(req.text.strip(), req.terms, req.direction)
