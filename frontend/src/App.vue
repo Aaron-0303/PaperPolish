@@ -8,8 +8,8 @@ const activeTool = ref('terms')
 const showSidebar = ref(false)
 const activeStage = ref('source')
 const draftStage = ref('chinese')
-const loading = ref('')
-const modelAction = ref('')
+const loading = ref(false)
+const modelAction = ref(false)
 
 const source = ref('')
 const chinese = ref('')
@@ -233,7 +233,7 @@ async function manageModel(action){
     const r=await fetch(`/api/model/${action}`,{method:'POST'}); const d=await r.json(); if(!r.ok) throw new Error(d.detail||'模型操作失败')
     await checkHealth(); notify(action==='load'?'模型加载完成':'模型已卸载','success')
   }catch(e){ notify(e.message,'error'); await checkHealth() }
-  finally{ modelAction.value='' }
+  finally{ modelAction.value=false }
 }
 async function fetchRemoteModels(){
   if(!remoteApiKey.value.trim()) return notify('请先填写 API Key','warning')
@@ -267,7 +267,7 @@ async function translateToChinese(){
     const d=await r.json(); if(!r.ok) throw new Error(d.detail||'请求失败')
     chinese.value=d.result; activeStage.value='chinese'; notify('中文初稿已生成','success')
   }catch(e){ notify(e.message,'error') }
-  finally{ loading.value='' }
+  finally{ loading.value=false }
 }
 async function generatePolishedEnglish(){
   if(!chinese.value.trim()) return notify('先完成中文修改','warning')
@@ -276,7 +276,7 @@ async function generatePolishedEnglish(){
     const r=await generateEnglish(chinese.value.trim(),source.value); const d=await r.json(); if(!r.ok) throw new Error(d.detail||'请求失败')
     finalEnglish.value=d.result; activeStage.value='final'; notify(`已通过 ${finalEngineLabel.value} 生成学术英文`,'success')
   }catch(e){ notify(e.message,'error') }
-  finally{ loading.value='' }
+  finally{ loading.value=false }
 }
 async function generateDraftEnglish(){
   if(!draftChinese.value.trim()) return notify('先输入中文初稿','warning')
@@ -285,7 +285,7 @@ async function generateDraftEnglish(){
     const r=await generateEnglish(draftChinese.value.trim(),''); const d=await r.json(); if(!r.ok) throw new Error(d.detail||'请求失败')
     draftEnglish.value=d.result; draftStage.value='english'; notify(`已通过 ${finalEngineLabel.value} 生成英文初稿`,'success')
   }catch(e){ notify(e.message,'error') }
-  finally{ loading.value='' }
+  finally{ loading.value=false }
 }
 
 function saveCurrent(){
