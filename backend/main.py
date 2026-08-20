@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Literal
 
+import httpx
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +19,9 @@ MODEL_DIR = Path(os.getenv("MODEL_DIR", "/models/Hy-MT2-7B"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16").lower()
 HOST_GPU_INDEX = os.getenv("HOST_GPU_INDEX", os.getenv("NVIDIA_VISIBLE_DEVICES", "0"))
+REMOTE_API_BASE = "https://api.gpt.ge"
 
-app = FastAPI(title="PaperPolish API", version="0.5.1")
+app = FastAPI(title="PaperPolish API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 _tokenizer = None
@@ -56,6 +58,17 @@ class TranslateRequest(BaseModel):
     preferences: list[str] = []
     format_type: str = "LaTeX"
     background_text: str = ""
+
+class RemoteModelsRequest(BaseModel):
+    api_key: str = Field(min_length=1)
+
+class RemotePolishRequest(BaseModel):
+    text: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    original_english: str = ""
+    style: str = "CVPR/IEEE concise academic style"
+    terms: list[Term] = []
 
 
 def torch_dtype():
@@ -196,6 +209,88 @@ def generate(prompt:str)->str:
     generated=output[0,inputs["input_ids"].shape[-1]:]
     return _tokenizer.decode(generated,skip_special_tokens=True).strip()
 
+def remote_headers(api_key:str):
+    return {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
+
+def build_remote_polish_prompt(req:RemotePolishRequest, protected:str)->str:
+    original = req.original_english.strip()
+    style = req.style.strip() or "CVPR/IEEE concise academic style"
+    preferred = [(t.chinese.strip(), t.english.strip()) for t in req.terms if t.chinese.strip() and t.english.strip()]
+    term_text = "\n".join(f"- {zh} -> {en}" for zh,en in preferred) or "- None"
+    original_block = original if original else "No original English paragraph was provided."
+    return f"""You are an expert academic English editor for computer vision and robotics papers.
+
+Task: Rewrite the edited Chinese paragraph into polished academic English.
+
+Requirements:
+1. Preserve the author's intended technical meaning exactly.
+2. Use {style}.
+3. Be concise, technically precise, and natural. Avoid inflated claims and unnecessary adjectives.
+4. Use the original English only as semantic and terminology context; do not blindly copy mistakes from it.
+5. Follow the terminology mappings below when applicable.
+6. Strings shaped like PPPROTECT0000TOKEN are immutable placeholders. Preserve every such placeholder exactly once and in the same logical position. Never translate, alter, duplicate, or remove them.
+7. Output only the final English paragraph. Do not add explanations, headings, quotes, or Markdown fences.
+
+Terminology:
+{term_text}
+
+Original English context:
+{original_block}
+
+Edited Chinese:
+{protected}
+"""
+
+def remote_models(api_key:str):
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response=client.get(f"{REMOTE_API_BASE}/v1/models",headers=remote_headers(api_key))
+        if response.status_code >= 400:
+            detail=response.text[:500]
+            raise HTTPException(status_code=response.status_code,detail=f"API 模型列表请求失败: {detail}")
+        data=response.json()
+        models=sorted({item.get("id") for item in data.get("data",[]) if isinstance(item,dict) and item.get("id")})
+        return models
+    except HTTPException:
+        raise
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504,detail="API 模型列表请求超时。") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502,detail=f"无法连接远程 API: {exc}") from exc
+
+def remote_polish(req:RemotePolishRequest):
+    protected,replacements=protect_text(req.text.strip(),req.terms,"zh-en")
+    payload={
+        "model":req.model.strip(),
+        "messages":[
+            {"role":"system","content":"You are a rigorous academic English writing assistant. Return only the requested final text."},
+            {"role":"user","content":build_remote_polish_prompt(req,protected)},
+        ],
+        "max_tokens":MAX_NEW_TOKENS,
+        "temperature":0.2,
+        "stream":False,
+    }
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            response=client.post(f"{REMOTE_API_BASE}/v1/chat/completions",headers=remote_headers(req.api_key),json=payload)
+        if response.status_code >= 400:
+            detail=response.text[:800]
+            raise HTTPException(status_code=response.status_code,detail=f"API 生成失败: {detail}")
+        data=response.json()
+        choices=data.get("choices") or []
+        content=choices[0].get("message",{}).get("content","") if choices else ""
+        if not isinstance(content,str) or not content.strip():
+            raise HTTPException(status_code=502,detail="API 返回为空或响应格式不正确。")
+        return restore_text(content.strip(),replacements)
+    except HTTPException:
+        raise
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504,detail="API 生成请求超时。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502,detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502,detail=f"远程 API 请求失败: {exc}") from exc
+
 @app.get("/api/health")
 def health(): return {"status":"ok",**model_status()}
 @app.get("/api/model/status")
@@ -211,6 +306,12 @@ def api_load_model():
 def api_unload_model():
     try: unload_model(); return {"ok":True,**model_status()}
     except RuntimeError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
+@app.post("/api/remote/models")
+def api_remote_models(req:RemoteModelsRequest):
+    return {"models":remote_models(req.api_key),"base_url":REMOTE_API_BASE}
+@app.post("/api/remote/polish")
+def api_remote_polish(req:RemotePolishRequest):
+    return {"result":remote_polish(req),"model":req.model,"engine":"remote"}
 @app.post("/api/translate")
 def translate(req:TranslateRequest):
     if _model is None: raise HTTPException(status_code=409,detail="Hy-MT2-7B 尚未加载，请先在模型管理中加载模型。")
