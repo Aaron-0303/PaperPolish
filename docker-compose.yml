@@ -4,8 +4,7 @@ services:
       context: ./backend
     container_name: paperpolish-backend
     restart: unless-stopped
-    gpus:
-      - device=3
+    runtime: nvidia
     environment:
       NVIDIA_VISIBLE_DEVICES: "3"
       HOST_GPU_INDEX: "3"
