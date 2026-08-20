@@ -17,8 +17,9 @@ MODEL_ID = os.getenv("MODEL_ID", "tencent/Hy-MT2-7B")
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "/models/Hy-MT2-7B"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16").lower()
+HOST_GPU_INDEX = os.getenv("HOST_GPU_INDEX", os.getenv("NVIDIA_VISIBLE_DEVICES", "0"))
 
-app = FastAPI(title="PaperPolish API", version="0.5.0")
+app = FastAPI(title="PaperPolish API", version="0.5.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 _tokenizer = None
@@ -103,15 +104,20 @@ def unload_model():
 
 def gpu_status():
     if not torch.cuda.is_available():
-        return {"available": False, "name": None, "allocated_mb": 0, "reserved_mb": 0, "used_mb": 0, "free_mb": 0, "total_mb": 0}
+        return {"available": False, "name": None, "allocated_mb": 0, "reserved_mb": 0, "used_mb": 0, "free_mb": 0, "total_mb": 0, "host_device": HOST_GPU_INDEX}
     device = torch.cuda.current_device()
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     total_mb, free_mb = total_bytes / 1048576, free_bytes / 1048576
     return {
-        "available": True, "name": torch.cuda.get_device_name(device), "device": device,
+        "available": True,
+        "name": torch.cuda.get_device_name(device),
+        "device": device,
+        "host_device": HOST_GPU_INDEX,
         "allocated_mb": round(torch.cuda.memory_allocated(device)/1048576,1),
         "reserved_mb": round(torch.cuda.memory_reserved(device)/1048576,1),
-        "used_mb": round(total_mb-free_mb,1), "free_mb": round(free_mb,1), "total_mb": round(total_mb,1),
+        "used_mb": round(total_mb-free_mb,1),
+        "free_mb": round(free_mb,1),
+        "total_mb": round(total_mb,1),
     }
 
 def model_status():
@@ -150,7 +156,6 @@ def terminology_lines(terms:list[Term], chinese_prompt:bool=False)->str:
 
 def build_prompt(req:TranslateRequest, protected:str)->str:
     target_lang = "Chinese" if req.direction=="en-zh" else "English"
-    chinese_prompt = req.direction=="zh-en"
     source = protected
 
     if req.mode == "default":
@@ -178,7 +183,6 @@ def build_prompt(req:TranslateRequest, protected:str)->str:
     if req.mode == "structured-data-2":
         return f"[Background Information]\n{background}\n\nPlease translate the following text into {target_lang}, taking the provided background information into consideration.\n\n[Source Text]\n{source}"
 
-    # PaperPolish mode: combine official Hy-MT2 instruction patterns for paper translation.
     term_hint=terminology_lines(req.terms, chinese_prompt=False)
     style=req.style.strip() or "CVPR/IEEE concise academic style"
     delimiter_rule=("Strings shaped like PPPROTECT0000TOKEN are immutable delimiters. You must retain the exact same number of delimiters in the translation. Strictly do not omit, escape, translate, duplicate, or reorder them.\n\n")
