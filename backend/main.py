@@ -1,5 +1,7 @@
+import gc
 import os
 import re
+import time
 from pathlib import Path
 from threading import Lock
 from typing import Literal
@@ -16,7 +18,7 @@ MODEL_DIR = Path(os.getenv("MODEL_DIR", "/models/Hy-MT2-7B"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16").lower()
 
-app = FastAPI(title="PaperPolish API", version="0.3.0")
+app = FastAPI(title="PaperPolish API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,6 +31,9 @@ _tokenizer = None
 _model = None
 _model_lock = Lock()
 _infer_lock = Lock()
+_model_state = "unloaded"
+_last_error = ""
+_last_load_seconds = None
 
 LATEX_PATTERNS = [
     r"\\begin\{[^{}]+\}.*?\\end\{[^{}]+\}",
@@ -62,8 +67,12 @@ def torch_dtype():
     return torch.bfloat16
 
 
+def model_files_ready() -> bool:
+    return (MODEL_DIR / "config.json").exists()
+
+
 def ensure_model_files():
-    if (MODEL_DIR / "config.json").exists():
+    if model_files_ready():
         return
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     snapshot_download(
@@ -74,21 +83,98 @@ def ensure_model_files():
 
 
 def load_model():
-    global _tokenizer, _model
+    global _tokenizer, _model, _model_state, _last_error, _last_load_seconds
     if _model is not None:
         return
+
     with _model_lock:
         if _model is not None:
             return
-        ensure_model_files()
-        _tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
-        _model = AutoModelForCausalLM.from_pretrained(
-            str(MODEL_DIR),
-            dtype=torch_dtype(),
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        _model.eval()
+        if _model_state == "loading":
+            raise RuntimeError("模型正在加载，请稍后刷新状态。")
+
+        _model_state = "loading"
+        _last_error = ""
+        started = time.perf_counter()
+        try:
+            ensure_model_files()
+            _tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+            _model = AutoModelForCausalLM.from_pretrained(
+                str(MODEL_DIR),
+                dtype=torch_dtype(),
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            _model.eval()
+            _last_load_seconds = round(time.perf_counter() - started, 2)
+            _model_state = "loaded"
+        except Exception as exc:
+            _tokenizer = None
+            _model = None
+            _model_state = "error"
+            _last_error = str(exc)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
+
+
+def unload_model():
+    global _tokenizer, _model, _model_state, _last_error
+    with _model_lock:
+        if _model_state == "loading":
+            raise RuntimeError("模型正在加载，当前不能卸载。")
+        with _infer_lock:
+            _model = None
+            _tokenizer = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            _model_state = "unloaded"
+            _last_error = ""
+
+
+def gpu_status():
+    if not torch.cuda.is_available():
+        return {
+            "available": False,
+            "name": None,
+            "allocated_mb": 0,
+            "reserved_mb": 0,
+            "used_mb": 0,
+            "free_mb": 0,
+            "total_mb": 0,
+        }
+
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    total_mb = total_bytes / 1024 / 1024
+    free_mb = free_bytes / 1024 / 1024
+    return {
+        "available": True,
+        "name": torch.cuda.get_device_name(device),
+        "device": device,
+        "allocated_mb": round(torch.cuda.memory_allocated(device) / 1024 / 1024, 1),
+        "reserved_mb": round(torch.cuda.memory_reserved(device) / 1024 / 1024, 1),
+        "used_mb": round(total_mb - free_mb, 1),
+        "free_mb": round(free_mb, 1),
+        "total_mb": round(total_mb, 1),
+    }
+
+
+def model_status():
+    return {
+        "status": _model_state,
+        "model_ready": _model is not None,
+        "model": MODEL_ID,
+        "model_dir": str(MODEL_DIR),
+        "downloaded": model_files_ready(),
+        "dtype": MODEL_DTYPE,
+        "last_load_seconds": _last_load_seconds,
+        "last_error": _last_error,
+        "gpu": gpu_status(),
+    }
 
 
 def _placeholder(index: int) -> str:
@@ -174,7 +260,9 @@ def build_prompt(req: TranslateRequest, protected: str) -> str:
 
 
 def generate(prompt: str) -> str:
-    load_model()
+    if _model is None or _tokenizer is None:
+        raise RuntimeError("模型尚未加载，请先在模型管理中点击“加载模型”。")
+
     messages = [{"role": "user", "content": prompt}]
     inputs = _tokenizer.apply_chat_template(
         messages,
@@ -197,33 +285,43 @@ def generate(prompt: str) -> str:
     return _tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
-@app.on_event("startup")
-def startup():
-    load_model()
-
-
 @app.get("/api/health")
 def health():
-    gpu = None
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        gpu = {
-            "name": torch.cuda.get_device_name(0),
-            "allocated_mb": round(torch.cuda.memory_allocated(0) / 1024 / 1024, 1),
-            "reserved_mb": round(torch.cuda.memory_reserved(0) / 1024 / 1024, 1),
-            "total_mb": round(props.total_memory / 1024 / 1024, 1),
-        }
-    return {
-        "status": "ok",
-        "model_ready": _model is not None,
-        "model": MODEL_ID,
-        "model_dir": str(MODEL_DIR),
-        "gpu": gpu,
-    }
+    return {"status": "ok", **model_status()}
+
+
+@app.get("/api/model/status")
+def get_model_status():
+    return model_status()
+
+
+@app.post("/api/model/load")
+def api_load_model():
+    try:
+        load_model()
+        return {"ok": True, **model_status()}
+    except torch.cuda.OutOfMemoryError as exc:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(status_code=503, detail="GPU 显存不足，Hy-MT2-7B 加载失败。") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"模型加载失败: {exc}") from exc
+
+
+@app.post("/api/model/unload")
+def api_unload_model():
+    try:
+        unload_model()
+        return {"ok": True, **model_status()}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/translate")
 def translate(req: TranslateRequest):
+    if _model is None:
+        raise HTTPException(status_code=409, detail="Hy-MT2-7B 尚未加载，请先在模型管理中加载模型。")
+
     protected, replacements = protect_text(req.text.strip(), req.terms, req.direction)
     prompt = build_prompt(req, protected)
     try:
@@ -233,5 +331,7 @@ def translate(req: TranslateRequest):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         raise HTTPException(status_code=503, detail="GPU 显存不足，无法完成本次翻译。") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
