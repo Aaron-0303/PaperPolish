@@ -4,8 +4,11 @@ services:
       context: ./backend
     container_name: paperpolish-backend
     restart: unless-stopped
-    gpus: all
+    gpus:
+      - device=3
     environment:
+      NVIDIA_VISIBLE_DEVICES: "3"
+      HOST_GPU_INDEX: "3"
       MODEL_ID: ${MODEL_ID:-tencent/Hy-MT2-7B}
       MODEL_DIR: /models/Hy-MT2-7B
       MODEL_DTYPE: ${MODEL_DTYPE:-bfloat16}
