@@ -91,7 +91,7 @@ cp .env.example .env
 MODEL_ID=tencent/Hy-MT2-7B
 MODEL_DTYPE=bfloat16
 MAX_NEW_TOKENS=4096
-HF_ENDPOINT=https://huggingface.co
+HF_ENDPOINT=https://hf-mirror.com
 ```
 
 ### 3. 启动
@@ -103,13 +103,20 @@ docker compose up -d --build
 访问：
 
 ```text
-http://127.0.0.1:30330
+http://127.0.0.1:30430
 ```
 
 后端调试接口：
 
 ```text
-http://127.0.0.1:8000/api/health
+http://127.0.0.1:30480/api/health
+```
+
+PaperPolish 使用独立端口，避免与 DeepSeek OCR 的 `30330 / 30380` 冲突：
+
+```text
+PaperPolish frontend: 30430
+PaperPolish backend:  30480
 ```
 
 ## 模型管理
@@ -137,7 +144,7 @@ http://127.0.0.1:8000/api/health
 
 如果模型权重已经存在，点击“加载模型”会直接从本地目录加载。
 
-如果模型权重不存在，第一次点击“下载并加载”时会从 Hugging Face 下载到：
+如果模型权重不存在，第一次点击“下载并加载”时会从 Hugging Face 镜像下载到：
 
 ```text
 ./models/Hy-MT2-7B/
