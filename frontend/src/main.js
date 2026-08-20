@@ -3,5 +3,6 @@ import App from './App.vue'
 import './style.css'
 import './quick-add.css'
 import './remote-engine.css'
+import './workspaces.css'
 
 createApp(App).mount('#app')
