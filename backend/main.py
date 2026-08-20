@@ -1,17 +1,22 @@
 import os
 import re
+from pathlib import Path
+from threading import Lock
 from typing import Literal
 
-import httpx
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from huggingface_hub import snapshot_download
 from pydantic import BaseModel, Field
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://model:8000/v1").rstrip("/")
-MODEL_NAME = os.getenv("MODEL_NAME", "/models/Hy-MT2-7B")
-REQUEST_TIMEOUT = float(os.getenv("MODEL_TIMEOUT", "300"))
+MODEL_ID = os.getenv("MODEL_ID", "tencent/Hy-MT2-7B")
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/models/Hy-MT2-7B"))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
+MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16").lower()
 
-app = FastAPI(title="PaperPolish API", version="0.2.0")
+app = FastAPI(title="PaperPolish API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +24,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_tokenizer = None
+_model = None
+_model_lock = Lock()
+_infer_lock = Lock()
 
 LATEX_PATTERNS = [
     r"\\begin\{[^{}]+\}.*?\\end\{[^{}]+\}",
@@ -42,6 +52,43 @@ class TranslateRequest(BaseModel):
     terms: list[Term] = []
     original_english: str = ""
     style: str = "CVPR/IEEE concise academic style"
+
+
+def torch_dtype():
+    if MODEL_DTYPE == "float16":
+        return torch.float16
+    if MODEL_DTYPE == "float32":
+        return torch.float32
+    return torch.bfloat16
+
+
+def ensure_model_files():
+    if (MODEL_DIR / "config.json").exists():
+        return
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=MODEL_ID,
+        local_dir=str(MODEL_DIR),
+        local_dir_use_symlinks=False,
+    )
+
+
+def load_model():
+    global _tokenizer, _model
+    if _model is not None:
+        return
+    with _model_lock:
+        if _model is not None:
+            return
+        ensure_model_files()
+        _tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+        _model = AutoModelForCausalLM.from_pretrained(
+            str(MODEL_DIR),
+            dtype=torch_dtype(),
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        _model.eval()
 
 
 def _placeholder(index: int) -> str:
@@ -126,44 +173,65 @@ def build_prompt(req: TranslateRequest, protected: str) -> str:
     )
 
 
-async def vllm_chat(prompt: str) -> str:
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7,
-        "top_p": 0.6,
-        "top_k": 20,
-        "repetition_penalty": 1.05,
-        "max_tokens": 4096,
-    }
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        response = await client.post(f"{MODEL_BASE_URL}/chat/completions", json=payload)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Hy-MT2 服务错误: {response.text[:500]}")
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+def generate(prompt: str) -> str:
+    load_model()
+    messages = [{"role": "user", "content": prompt}]
+    inputs = _tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(_model.device)
+
+    with _infer_lock, torch.inference_mode():
+        output = _model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.6,
+            top_k=20,
+            repetition_penalty=1.05,
+        )
+    generated = output[0, inputs["input_ids"].shape[-1]:]
+    return _tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
+@app.on_event("startup")
+def startup():
+    load_model()
 
 
 @app.get("/api/health")
-async def health():
-    model_ok = False
-    detail = "offline"
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{MODEL_BASE_URL}/models")
-        model_ok = response.is_success
-        detail = "ready" if model_ok else f"http-{response.status_code}"
-    except httpx.HTTPError:
-        pass
-    return {"status": "ok", "model_ready": model_ok, "model": MODEL_NAME, "model_status": detail}
+def health():
+    gpu = None
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        gpu = {
+            "name": torch.cuda.get_device_name(0),
+            "allocated_mb": round(torch.cuda.memory_allocated(0) / 1024 / 1024, 1),
+            "reserved_mb": round(torch.cuda.memory_reserved(0) / 1024 / 1024, 1),
+            "total_mb": round(props.total_memory / 1024 / 1024, 1),
+        }
+    return {
+        "status": "ok",
+        "model_ready": _model is not None,
+        "model": MODEL_ID,
+        "model_dir": str(MODEL_DIR),
+        "gpu": gpu,
+    }
 
 
 @app.post("/api/translate")
-async def translate(req: TranslateRequest):
+def translate(req: TranslateRequest):
     protected, replacements = protect_text(req.text.strip(), req.terms, req.direction)
     prompt = build_prompt(req, protected)
     try:
-        result = restore_text(await vllm_chat(prompt), replacements)
+        result = restore_text(generate(prompt), replacements)
         return {"result": result}
+    except torch.cuda.OutOfMemoryError as exc:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(status_code=503, detail="GPU 显存不足，无法完成本次翻译。") from exc
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
