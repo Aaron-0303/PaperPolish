@@ -1,0 +1,28 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: paperpolish-backend
+    restart: unless-stopped
+    gpus: all
+    environment:
+      MODEL_ID: ${MODEL_ID:-tencent/Hy-MT2-7B}
+      MODEL_DIR: /models/Hy-MT2-7B
+      MODEL_DTYPE: ${MODEL_DTYPE:-bfloat16}
+      MAX_NEW_TOKENS: ${MAX_NEW_TOKENS:-4096}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    volumes:
+      - ./models:/models
+    ports:
+      - "8000:8000"
+    shm_size: "8gb"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: paperpolish-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "30330:80"
