@@ -4,5 +4,6 @@ import './style.css'
 import './quick-add.css'
 import './remote-engine.css'
 import './workspaces.css'
+import './generation-settings.css'
 
 createApp(App).mount('#app')
