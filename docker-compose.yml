@@ -4,7 +4,6 @@ services:
       context: ./backend
     container_name: paperpolish-backend
     restart: unless-stopped
-    runtime: nvidia
     environment:
       NVIDIA_VISIBLE_DEVICES: "3"
       HOST_GPU_INDEX: "3"
@@ -16,8 +15,15 @@ services:
     volumes:
       - ./models:/models
     ports:
-      - "30480:8000"
+      - "${API_PORT:-30480}:8000"
     shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
 
   frontend:
     build:
@@ -27,4 +33,4 @@ services:
     depends_on:
       - backend
     ports:
-      - "30430:80"
+      - "${FRONTEND_PORT:-30430}:80"
