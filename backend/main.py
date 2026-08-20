@@ -35,6 +35,7 @@ LATEX_PATTERNS = [
     r"\\\(.*?\\\)", r"\$[^$\n]+\$",
     r"\\(?:cite|citep|citet|ref|cref|Cref|eqref|autoref|label)\*?(?:\[[^\]]*\])?\{[^{}]*\}",
 ]
+PLACEHOLDER_PATTERN = re.compile(r"PPPROTECT\d{4}TOKEN")
 
 TranslationMode = Literal[
     "paper", "default", "terminology", "style", "personalization",
@@ -122,8 +123,6 @@ def load_model_gpu():
                 _tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
 
             if _model is None:
-                # First load: do not preload and retain a CPU copy at service startup.
-                # The user action performs the complete disk -> model -> GPU transition.
                 _model = AutoModelForCausalLM.from_pretrained(
                     str(MODEL_DIR),
                     dtype=torch_dtype(),
@@ -137,7 +136,6 @@ def load_model_gpu():
             _model_state = "gpu_ready"
             _model_message = "模型已在显存中，可以开始翻译"
         except Exception as exc:
-            # Keep an already-created CPU model reusable if GPU transfer failed.
             if _model is not None and not model_on_gpu():
                 _model_state = "cpu_ready"
                 _model_message = "模型位于 CPU 内存，加载到 GPU 失败"
@@ -251,7 +249,20 @@ def restore_text(text, replacements):
         if token not in text:
             raise ValueError(f"模型未保留受保护占位符 {token}")
         text = text.replace(token, value)
-    return text
+
+    # Any token left after restoring the real placeholders was hallucinated by the model.
+    # Never expose internal PaperPolish placeholders to the user.
+    text = PLACEHOLDER_PATTERN.sub("", text)
+    return text.strip()
+
+
+def placeholder_instruction(source: str) -> str:
+    if not PLACEHOLDER_PATTERN.search(source):
+        return ""
+    return (
+        "Preserve every placeholder token already present in the source text exactly once and in the same logical position. "
+        "Do not alter, translate, duplicate, remove, or invent placeholder tokens.\n\n"
+    )
 
 
 def terminology_lines(terms: list[Term], direction: str) -> str:
@@ -266,36 +277,36 @@ def terminology_lines(terms: list[Term], direction: str) -> str:
 def build_prompt(req: TranslateRequest, protected: str) -> str:
     target_lang = "Chinese" if req.direction == "en-zh" else "English"
     source = protected
+    placeholder_rule = placeholder_instruction(source)
 
     if req.mode == "default":
-        return f"Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:\n\n{source}"
+        return placeholder_rule + f"Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:\n\n{source}"
 
     if req.mode == "terminology":
-        return terminology_lines(req.terms, req.direction) + f"Translate the following text into {target_lang}. Note that you must ONLY output the translated result without any additional explanation:\n\n{source}"
+        return placeholder_rule + terminology_lines(req.terms, req.direction) + f"Translate the following text into {target_lang}. Note that you must ONLY output the translated result without any additional explanation:\n\n{source}"
 
     if req.mode == "style":
-        return f"Please translate the following text into {target_lang}. Note that the translation style must strictly conform to [{req.style.strip() or 'academic writing'}]:\n\n{source}"
+        return placeholder_rule + f"Please translate the following text into {target_lang}. Note that the translation style must strictly conform to [{req.style.strip() or 'academic writing'}]:\n\n{source}"
 
     if req.mode == "personalization":
         prefs = req.preferences or ["Preserve technical meaning", "Use concise academic wording"]
         tasks = "\n".join(f"{i + 1}. {p}" for i, p in enumerate(prefs))
-        return f"[Source Text]\n{source}\n\n[Translation Tasks]\n{tasks}\n{len(prefs) + 1}. Translate the [Source Text] into {target_lang}."
+        return placeholder_rule + f"[Source Text]\n{source}\n\n[Translation Tasks]\n{tasks}\n{len(prefs) + 1}. Translate the [Source Text] into {target_lang}."
 
     if req.mode == "delimiters":
-        return f"Please accurately translate the following text into {target_lang}.\nYou must retain the exact same number of delimiters in the translation. Strictly do not omit, escape, or translate these symbols, and pay close attention to their placement.\n\n{source}"
+        return placeholder_rule + f"Please accurately translate the following text into {target_lang}.\nYou must retain the exact same number of delimiters in the translation. Strictly do not omit, escape, or translate these symbols, and pay close attention to their placement.\n\n{source}"
 
     if req.mode == "structured-data-1":
         ft = req.format_type.strip() or "LaTeX"
-        return f"### Task\nTranslate the user-facing text within the following {ft} data into {target_lang}.\n\n### Strict Rules\n1. Structure Preservation: You MUST preserve the original {ft} data structure, nesting, hierarchy, and indentation exactly as they are.\n2. Selective Translation: Translate ONLY the visible, user-facing text content/values.\n3. Strict Non-Translation: NEVER translate or alter code tags, keys, properties, object names, or variable placeholders. Leave them exactly in their original English/code form.\n\n### Source Data\n{source}"
+        return placeholder_rule + f"### Task\nTranslate the user-facing text within the following {ft} data into {target_lang}.\n\n### Strict Rules\n1. Structure Preservation: You MUST preserve the original {ft} data structure, nesting, hierarchy, and indentation exactly as they are.\n2. Selective Translation: Translate ONLY the visible, user-facing text content/values.\n3. Strict Non-Translation: NEVER translate or alter code tags, keys, properties, object names, or variable placeholders. Leave them exactly in their original English/code form.\n\n### Source Data\n{source}"
 
     background = (req.background_text or req.original_english).strip() or "This text is from a scientific paper."
     if req.mode == "structured-data-2":
-        return f"[Background Information]\n{background}\n\nPlease translate the following text into {target_lang}, taking the provided background information into consideration.\n\n[Source Text]\n{source}"
+        return placeholder_rule + f"[Background Information]\n{background}\n\nPlease translate the following text into {target_lang}, taking the provided background information into consideration.\n\n[Source Text]\n{source}"
 
     term_hint = terminology_lines(req.terms, req.direction)
     style = req.style.strip() or "CVPR/IEEE concise academic style"
-    delimiter_rule = "Strings shaped like PPPROTECT0000TOKEN are immutable delimiters. You must retain the exact same number of delimiters in the translation. Strictly do not omit, escape, translate, duplicate, or reorder them.\n\n"
-    return delimiter_rule + term_hint + f"[Background Information]\n{background}\n\nPlease translate the following text into {target_lang}, taking the provided background information into consideration. Note that the translation style must strictly conform to [{style}]. Only output the translated result without any additional explanation.\n\n[Source Text]\n{source}"
+    return placeholder_rule + term_hint + f"[Background Information]\n{background}\n\nPlease translate the following text into {target_lang}, taking the provided background information into consideration. Note that the translation style must strictly conform to [{style}]. Only output the translated result without any additional explanation.\n\n[Source Text]\n{source}"
 
 
 def generate(prompt: str) -> str:
@@ -334,6 +345,7 @@ def build_remote_polish_prompt(req: RemotePolishRequest, protected: str) -> str:
     preferred = [(t.chinese.strip(), t.english.strip()) for t in req.terms if t.chinese.strip() and t.english.strip()]
     term_text = "\n".join(f"- {zh} -> {en}" for zh, en in preferred) or "- None"
     original_block = original if original else "No original English paragraph was provided."
+    placeholder_rule = placeholder_instruction(protected)
     return f"""You are an expert academic English editor for computer vision and robotics papers.
 
 Task: Rewrite the edited Chinese paragraph into polished academic English.
@@ -344,10 +356,9 @@ Requirements:
 3. Be concise, technically precise, and natural. Avoid inflated claims and unnecessary adjectives.
 4. Use the original English only as semantic and terminology context; do not blindly copy mistakes from it.
 5. Follow the terminology mappings below when applicable.
-6. Strings shaped like PPPROTECT0000TOKEN are immutable placeholders. Preserve every such placeholder exactly once and in the same logical position. Never translate, alter, duplicate, or remove them.
-7. Output only the final English paragraph. Do not add explanations, headings, quotes, or Markdown fences.
+6. Output only the final English paragraph. Do not add explanations, headings, quotes, or Markdown fences.
 
-Terminology:
+{placeholder_rule}Terminology:
 {term_text}
 
 Original English context:
@@ -409,7 +420,7 @@ def remote_polish(req: RemotePolishRequest):
         raise HTTPException(status_code=502, detail=f"远程 API 请求失败: {exc}") from exc
 
 
-app = FastAPI(title="PaperPolish API", version="0.7.1")
+app = FastAPI(title="PaperPolish API", version="0.7.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -455,7 +466,6 @@ def api_offload_model_cpu():
         raise HTTPException(status_code=500, detail=f"模型卸载到内存失败: {exc}") from exc
 
 
-# Backward-compatible aliases for the current Vue frontend.
 @app.post("/api/model/load")
 def api_load_model_compat():
     return api_load_model_gpu()
