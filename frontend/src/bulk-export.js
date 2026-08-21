@@ -18,9 +18,14 @@ function safeFilename(name){
   return String(name||'glossary').replace(/[\\/:*?"<>|]/g,'_').trim()||'glossary'
 }
 
+function currentGlossaryName(){
+  return document.querySelector('.group-card.active .group-copy strong')?.textContent?.trim()
+    || document.querySelector('.title-input')?.value?.trim()
+    || ''
+}
+
 function exportCurrentGlossary(){
-  const target=document.querySelector('.bulk-import-target strong')
-  const groupName=target?.textContent?.trim()
+  const groupName=currentGlossaryName()
   if(!groupName) return
 
   const {groups,terms}=loadGlossaryData()
@@ -45,17 +50,34 @@ function exportCurrentGlossary(){
   URL.revokeObjectURL(url)
 }
 
-function mountBulkExportButton(){
-  const actions=document.querySelector('.bulk-import-actions')
-  if(!actions||actions.querySelector('.bulk-export-button')) return
+function mountGlossaryExportButton(){
+  const groupActions=document.querySelector('.glossary-detail .group-actions')
+  if(!groupActions||groupActions.querySelector('.bulk-export-button')) return
+  const importButton=[...groupActions.querySelectorAll('button')].find(button=>button.textContent.trim()==='批量导入')
+  if(!importButton) return
+
   const button=document.createElement('button')
   button.type='button'
   button.className='btn secondary bulk-export-button'
-  button.textContent='批量导出 CSV'
+  button.textContent='批量导出'
   button.addEventListener('click',exportCurrentGlossary)
-  actions.prepend(button)
+  importButton.insertAdjacentElement('afterend',button)
 }
 
-const observer=new MutationObserver(mountBulkExportButton)
+function tidyBulkImportPage(){
+  document.querySelectorAll('.bulk-import-actions .bulk-export-button').forEach(button=>button.remove())
+  document.querySelectorAll('.bulk-import-guide').forEach(guide=>guide.remove())
+  const textarea=document.querySelector('.bulk-import-textarea')
+  if(textarea){
+    textarea.placeholder='在这里粘贴术语，每行一条···\nvisual odometry,视觉里程计,preferred\nDROID-SLAM,DROID-SLAM,locked\nactive mapping,主动建图'
+  }
+}
+
+function refreshBulkControls(){
+  mountGlossaryExportButton()
+  tidyBulkImportPage()
+}
+
+const observer=new MutationObserver(refreshBulkControls)
 observer.observe(document.documentElement,{childList:true,subtree:true})
-queueMicrotask(mountBulkExportButton)
+queueMicrotask(refreshBulkControls)
