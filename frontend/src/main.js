@@ -7,5 +7,6 @@ import './workspaces.css'
 import './generation-settings.css'
 import './editor-justify.css'
 import './bulk-import.css'
+import './bulk-export.js'
 
 createApp(App).mount('#app')
