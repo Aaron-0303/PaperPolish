@@ -6,5 +6,6 @@ import './remote-engine.css'
 import './workspaces.css'
 import './generation-settings.css'
 import './editor-justify.css'
+import './bulk-import.css'
 
 createApp(App).mount('#app')
