@@ -46,6 +46,8 @@ const groupEditor = reactive({ name:'', description:'' })
 const editingTermId = ref('')
 const editingTerm = reactive({ english:'', chinese:'', type:'locked' })
 const pendingDeleteGroupId = ref('')
+const showBulkImport = ref(false)
+const bulkImportText = ref('')
 
 const translationModes = [
   {
@@ -120,6 +122,7 @@ const modelLabel = computed(() => modelStatus.status === 'offline' ? '后端离�
 const gpuPercent = computed(() => modelStatus.gpu?.available && modelStatus.gpu.total_mb ? Math.min(100, Math.max(0, modelStatus.gpu.used_mb / modelStatus.gpu.total_mb * 100)) : 0)
 const currentHistory = computed(() => history.value.filter(item => (item.workflow || 'polish') === activeView.value))
 const currentMode = computed(() => translationModes.find(item => item.id === mode.value) || translationModes[0])
+const bulkImportResult = computed(() => parseBulkImport(bulkImportText.value))
 
 watch(activeView, v => localStorage.setItem('paperpolish_active_view_v1', v))
 watch([source,chinese,finalEnglish], () => localStorage.setItem('paperpolish_polish_draft_v1', JSON.stringify({ source:source.value, chinese:chinese.value, finalEnglish:finalEnglish.value })))
@@ -218,6 +221,56 @@ function addManagerTerm(){
 function startEditTerm(term){ editingTermId.value=term.id; editingTerm.english=term.english; editingTerm.chinese=term.chinese; editingTerm.type=term.type }
 function saveTermEdit(term){ term.english=editingTerm.english.trim(); term.chinese=editingTerm.chinese.trim(); term.type=editingTerm.type; editingTermId.value=''; notify('术语已更新','success') }
 function deleteTerm(id){ glossaryTerms.value=glossaryTerms.value.filter(t=>t.id!==id); notify('术语已删除','success') }
+function parseCsvLine(line){
+  const values=[]; let current=''; let quoted=false
+  for(let i=0;i<line.length;i++){
+    const char=line[i]
+    if(char==='"'){
+      if(quoted&&line[i+1]==='"'){ current+='"'; i++ }
+      else quoted=!quoted
+    }else if(char===','&&!quoted){ values.push(current.trim()); current='' }
+    else current+=char
+  }
+  if(quoted) return null
+  values.push(current.trim())
+  return values
+}
+function parseBulkImport(text){
+  const rows=[]; const invalid=[]
+  text.split(/\r?\n/).forEach((raw,index)=>{
+    const line=raw.trim(); if(!line) return
+    const values=parseCsvLine(line)
+    if(!values||values.length<2){ invalid.push(index+1); return }
+    const english=(values[0]||'').trim(); const chinese=(values[1]||'').trim()
+    const rawType=(values[2]||'preferred').trim().toLowerCase()
+    if(!english||!chinese||!['locked','preferred'].includes(rawType)){ invalid.push(index+1); return }
+    rows.push({english,chinese,type:rawType})
+  })
+  return {rows,invalid}
+}
+function openBulkImport(){
+  if(!selectedGroup.value) return notify('请先选择术语库','warning')
+  bulkImportText.value=''; showBulkImport.value=true
+}
+function closeBulkImport(){ showBulkImport.value=false; bulkImportText.value='' }
+function importBulkTerms(){
+  const group=selectedGroup.value
+  if(!group) return notify('目标术语库不存在','error')
+  const {rows,invalid}=bulkImportResult.value
+  if(invalid.length) return notify(`第 ${invalid.slice(0,6).join('、')} 行格式不正确，请先修正`,'warning')
+  if(!rows.length) return notify('请先粘贴需要导入的术语','warning')
+  const existing=new Set(selectedGroupTerms.value.map(t=>`${t.english.trim().toLowerCase()}\u0000${t.chinese.trim()}`))
+  let added=0; let skipped=0
+  rows.forEach(row=>{
+    const key=`${row.english.toLowerCase()}\u0000${row.chinese}`
+    if(existing.has(key)){ skipped++; return }
+    existing.add(key)
+    glossaryTerms.value.push({id:makeId('term'),groupId:group.id,...row})
+    added++
+  })
+  closeBulkImport()
+  notify(skipped?`已导入 ${added} 个术语，跳过 ${skipped} 个重复项`:`已导入 ${added} 个术语`,'success')
+}
 
 async function checkHealth(){
   try{
@@ -455,10 +508,27 @@ onMounted(()=>{
     <div class="glossary-page-head"><div><span class="eyebrow">GLOSSARY LIBRARY</span><h1>术语库</h1><p>按论文、项目或研究方向组织术语。润色和初稿工作区共享这些术语库。</p></div><div class="glossary-page-stats"><div><strong>{{ glossaryGroups.length }}</strong><span>术语库</span></div><div><strong>{{ glossaryTerms.length }}</strong><span>术语</span></div><div><strong>{{ selectedGlossaryIds.length }}</strong><span>当前启用</span></div></div></div>
     <div class="glossary-layout">
       <aside class="glossary-groups-panel"><div class="panel-section-title"><strong>所有术语库</strong><span>{{ glossaryGroups.length }}</span></div><div class="group-list"><button v-for="group in glossaryGroups" :key="group.id" :class="['group-card',{active:selectedGroupId===group.id}]" @click="selectGroup(group.id)"><span class="group-icon">Aa</span><span class="group-copy"><strong>{{ group.name }}</strong><small>{{ glossaryTerms.filter(t=>t.groupId===group.id).length }} 个术语</small></span><span v-if="selectedGlossaryIds.includes(group.id)" class="enabled-dot"></span></button></div><div class="new-group-card"><label class="field-label">新建术语库</label><input v-model="newGroup.name" class="control" placeholder="例如：3DGS / Active Mapping"/><textarea v-model="newGroup.description" class="control mini-area" placeholder="可选说明"></textarea><button class="btn primary wide" @click="createGroup">创建术语库</button></div></aside>
-      <section v-if="selectedGroup" class="glossary-detail"><div class="glossary-detail-head"><div class="group-title-block"><div class="large-group-icon">Aa</div><div><input v-model="groupEditor.name" class="title-input"/><input v-model="groupEditor.description" class="description-input" placeholder="添加说明…"/></div></div><div class="group-actions"><label class="enable-switch"><input type="checkbox" :checked="selectedGlossaryIds.includes(selectedGroup.id)" @change="toggleGlossary(selectedGroup.id)"/><span></span><b>{{ selectedGlossaryIds.includes(selectedGroup.id)?'参与生成':'不参与生成' }}</b></label><button class="btn secondary" @click="saveGroup">保存信息</button><button class="btn danger-ghost" @click="pendingDeleteGroupId=selectedGroup.id">删除术语库</button></div></div><div v-if="pendingDeleteGroupId===selectedGroup.id" class="delete-confirm"><span>该组内 {{ selectedGroupTerms.length }} 个术语也会一起删除。</span><div><button class="btn ghost" @click="pendingDeleteGroupId=''">取消</button><button class="btn danger" @click="confirmDeleteGroup">确认删除</button></div></div><div class="add-term-bar"><input v-model="managerTerm.english" class="control" placeholder="English term"/><input v-model="managerTerm.chinese" class="control" placeholder="中文对应"/><select v-model="managerTerm.type" class="control"><option value="locked">Locked</option><option value="preferred">Preferred</option></select><button class="btn primary" @click="addManagerTerm">添加术语</button></div><div class="terms-table-wrap"><table class="terms-table"><thead><tr><th>英文术语</th><th>中文对应</th><th>类型</th><th class="actions-col">操作</th></tr></thead><tbody><tr v-for="term in selectedGroupTerms" :key="term.id"><template v-if="editingTermId===term.id"><td><input v-model="editingTerm.english" class="table-input"/></td><td><input v-model="editingTerm.chinese" class="table-input"/></td><td><select v-model="editingTerm.type" class="table-input"><option value="locked">Locked</option><option value="preferred">Preferred</option></select></td><td class="row-actions"><button class="mini-action primary-text" @click="saveTermEdit(term)">保存</button><button class="mini-action" @click="editingTermId=''">取消</button></td></template><template v-else><td><strong>{{ term.english||'—' }}</strong></td><td>{{ term.chinese||'—' }}</td><td><span :class="['term-type-badge',term.type]">{{ term.type }}</span></td><td class="row-actions"><button class="mini-action" @click="startEditTerm(term)">编辑</button><button class="mini-action danger-text" @click="deleteTerm(term.id)">删除</button></td></template></tr><tr v-if="!selectedGroupTerms.length"><td colspan="4"><div class="table-empty">这个术语库还是空的。</div></td></tr></tbody></table></div></section>
+      <section v-if="selectedGroup" class="glossary-detail"><div class="glossary-detail-head"><div class="group-title-block"><div class="large-group-icon">Aa</div><div><input v-model="groupEditor.name" class="title-input"/><input v-model="groupEditor.description" class="description-input" placeholder="添加说明…"/></div></div><div class="group-actions"><label class="enable-switch"><input type="checkbox" :checked="selectedGlossaryIds.includes(selectedGroup.id)" @change="toggleGlossary(selectedGroup.id)"/><span></span><b>{{ selectedGlossaryIds.includes(selectedGroup.id)?'参与生成':'不参与生成' }}</b></label><button class="btn secondary" @click="openBulkImport">批量导入</button><button class="btn secondary" @click="saveGroup">保存信息</button><button class="btn danger-ghost" @click="pendingDeleteGroupId=selectedGroup.id">删除术语库</button></div></div><div v-if="pendingDeleteGroupId===selectedGroup.id" class="delete-confirm"><span>该组内 {{ selectedGroupTerms.length }} 个术语也会一起删除。</span><div><button class="btn ghost" @click="pendingDeleteGroupId=''">取消</button><button class="btn danger" @click="confirmDeleteGroup">确认删除</button></div></div><div class="add-term-bar"><input v-model="managerTerm.english" class="control" placeholder="English term"/><input v-model="managerTerm.chinese" class="control" placeholder="中文对应"/><select v-model="managerTerm.type" class="control"><option value="locked">Locked</option><option value="preferred">Preferred</option></select><button class="btn primary" @click="addManagerTerm">添加术语</button></div><div class="terms-table-wrap"><table class="terms-table"><thead><tr><th>英文术语</th><th>中文对应</th><th>类型</th><th class="actions-col">操作</th></tr></thead><tbody><tr v-for="term in selectedGroupTerms" :key="term.id"><template v-if="editingTermId===term.id"><td><input v-model="editingTerm.english" class="table-input"/></td><td><input v-model="editingTerm.chinese" class="table-input"/></td><td><select v-model="editingTerm.type" class="table-input"><option value="locked">Locked</option><option value="preferred">Preferred</option></select></td><td class="row-actions"><button class="mini-action primary-text" @click="saveTermEdit(term)">保存</button><button class="mini-action" @click="editingTermId=''">取消</button></td></template><template v-else><td><strong>{{ term.english||'—' }}</strong></td><td>{{ term.chinese||'—' }}</td><td><span :class="['term-type-badge',term.type]">{{ term.type }}</span></td><td class="row-actions"><button class="mini-action" @click="startEditTerm(term)">编辑</button><button class="mini-action danger-text" @click="deleteTerm(term.id)">删除</button></td></template></tr><tr v-if="!selectedGroupTerms.length"><td colspan="4"><div class="table-empty">这个术语库还是空的。</div></td></tr></tbody></table></div></section>
       <section v-else class="no-group-selected"><div class="large-group-icon">Aa</div><h2>创建第一个术语库</h2></section>
     </div>
   </main>
+
+  <section v-if="showBulkImport" class="bulk-import-page">
+    <div class="bulk-import-shell">
+      <div class="bulk-import-head">
+        <div><span class="eyebrow">BULK IMPORT</span><h1>批量导入术语</h1><p>每行一个术语，使用英文逗号分隔。第三列类型可省略，省略时默认 Preferred。</p></div>
+        <div class="bulk-import-target"><span>目标术语库</span><strong>{{ selectedGroup?.name }}</strong></div>
+      </div>
+      <div class="bulk-import-card">
+        <div class="bulk-import-guide"><div><h2>输入格式</h2><p>格式：英文术语,中文对应,类型。类型仅支持 <strong>locked</strong> 或 <strong>preferred</strong>。支持 CSV 双引号，因此术语本身包含逗号时也可以导入。</p></div><div class="bulk-import-example">visual odometry,视觉里程计,preferred\nDROID-SLAM,DROID-SLAM,locked\nactive mapping,主动建图</div></div>
+        <div class="bulk-import-body">
+          <textarea v-model="bulkImportText" class="bulk-import-textarea" spellcheck="false" placeholder="在这里粘贴术语，每行一条…"></textarea>
+          <div class="bulk-import-meta"><span>检测到 <strong>{{ bulkImportResult.rows.length }}</strong> 条可导入术语</span><span v-if="bulkImportResult.invalid.length" class="bulk-import-invalid">格式异常：第 {{ bulkImportResult.invalid.join('、') }} 行</span><span v-else>重复术语会自动跳过</span></div>
+          <div class="bulk-import-actions"><button class="btn ghost" @click="closeBulkImport">取消</button><button class="btn primary" :disabled="!bulkImportResult.rows.length||bulkImportResult.invalid.length" @click="importBulkTerms">导入到当前术语库</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
 
   <div v-if="showSidebar&&(activeView==='polish'||activeView==='draft')" class="sidebar-backdrop" @click="showSidebar=false"></div>
   <transition name="toast"><div v-if="toast.show" :class="['toast',toast.type]">{{ toast.message }}</div></transition>
