@@ -6,6 +6,10 @@ const ENGINE_KEY='paperpolish_final_engine_v1'
 const TENCENT_MODEL='hy-mt2-pro'
 const SERVER_KEY='__SERVER__'
 
+// Vue still expects a non-empty remoteApiKey. This sentinel is not a secret;
+// the backend resolves it to the provider-specific key stored on the server.
+localStorage.setItem(LEGACY_BROWSER_KEY,SERVER_KEY)
+
 let keyStatus={generic:false,tencent:false}
 const nativeFetch=window.fetch.bind(window)
 let mountQueued=false
@@ -109,7 +113,7 @@ async function saveProviderKey(panel){
     const data=await response.json().catch(()=>({}))
     if(!response.ok) throw new Error(data.detail||'保存失败')
     keyStatus[current]=true
-    localStorage.removeItem(LEGACY_BROWSER_KEY)
+    localStorage.setItem(LEGACY_BROWSER_KEY,SERVER_KEY)
     setVueInput(input,SERVER_KEY)
     setText(panel.querySelector('.provider-key-status'),`${providerLabel(current)} API Key 已保存在服务器。`)
   }catch(error){
@@ -263,7 +267,10 @@ async function handleRemoteEnglishToChinese(event){
   if(!text){showRemoteToast('先粘贴英文原文','warning');return}
   const model=currentRemoteModel()
   if(!model){showRemoteToast('请先在生成设置中选择 API 模型','warning');return}
-  if(!keyStatus[provider()]){showRemoteToast(`请先保存 ${providerLabel(provider())} API Key`,'warning');return}
+  if(!keyStatus[provider()]){
+    await refreshKeyStatus()
+    if(!keyStatus[provider()]){showRemoteToast(`请先保存 ${providerLabel(provider())} API Key`,'warning');return}
+  }
 
   button.dataset.remoteBusy='1'
   button.disabled=true
