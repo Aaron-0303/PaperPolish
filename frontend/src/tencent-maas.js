@@ -1,6 +1,8 @@
 const PROVIDER_KEY='paperpolish_remote_provider_v1'
 const GENERIC_MODEL_KEY='paperpolish_generic_remote_model_v1'
 const LEGACY_BROWSER_KEY='paperpolish_remote_api_key_v1'
+const REMOTE_MODEL_KEY='paperpolish_remote_model_v1'
+const ENGINE_KEY='paperpolish_final_engine_v1'
 const TENCENT_MODEL='hy-mt2-pro'
 const SERVER_KEY='__SERVER__'
 
@@ -17,6 +19,15 @@ function setVueInput(input,value){
   input.dispatchEvent(new Event('change',{bubbles:true}))
 }
 
+function setVueTextarea(input,value){
+  if(!input||input.value===value) return
+  const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set
+  if(setter) setter.call(input,value)
+  else input.value=value
+  input.dispatchEvent(new Event('input',{bubbles:true}))
+  input.dispatchEvent(new Event('change',{bubbles:true}))
+}
+
 function setText(node,value){
   if(node&&node.textContent!==value) node.textContent=value
 }
@@ -27,6 +38,45 @@ function provider(){
 
 function providerLabel(value){
   return value==='tencent'?'腾讯云 Hy-MT2 Pro':'通用 OpenAI API'
+}
+
+function currentRemoteModel(){
+  if(provider()==='tencent') return TENCENT_MODEL
+  return localStorage.getItem(REMOTE_MODEL_KEY)||localStorage.getItem(GENERIC_MODEL_KEY)||''
+}
+
+function activeTerms(){
+  try{
+    const groups=JSON.parse(localStorage.getItem('paperpolish_selected_glossaries_v3')||'[]')
+    const terms=JSON.parse(localStorage.getItem('paperpolish_glossary_terms_v3')||'[]')
+    return terms.filter(term=>groups.includes(term.groupId)).map(({english,chinese,type})=>({english,chinese,type}))
+  }catch{return []}
+}
+
+function remoteTranslatePayload(text,direction,originalEnglish=''){
+  return {
+    text,
+    direction,
+    api_key:SERVER_KEY,
+    model:currentRemoteModel(),
+    mode:localStorage.getItem('paperpolish_mode_v1')||'paper',
+    terms:activeTerms(),
+    original_english:originalEnglish,
+    style:localStorage.getItem('paperpolish_style_v2')||'CVPR/IEEE concise academic style',
+    preferences:(localStorage.getItem('paperpolish_preferences_v1')||'Preserve technical meaning\nUse concise academic wording\nDo not expand claims').split('\n').map(v=>v.trim()).filter(Boolean),
+    format_type:localStorage.getItem('paperpolish_format_v1')||'LaTeX',
+    background_text:localStorage.getItem('paperpolish_background_v1')||'',
+  }
+}
+
+function showRemoteToast(message,type='success'){
+  const old=document.querySelector('.remote-engine-toast')
+  old?.remove()
+  const node=document.createElement('div')
+  node.className=`toast ${type} remote-engine-toast`
+  node.textContent=message
+  document.body.appendChild(node)
+  setTimeout(()=>node.remove(),2600)
 }
 
 async function refreshKeyStatus(){
@@ -59,8 +109,8 @@ async function saveProviderKey(panel){
     const data=await response.json().catch(()=>({}))
     if(!response.ok) throw new Error(data.detail||'保存失败')
     keyStatus[current]=true
-    setVueInput(input,'')
     localStorage.removeItem(LEGACY_BROWSER_KEY)
+    setVueInput(input,SERVER_KEY)
     setText(panel.querySelector('.provider-key-status'),`${providerLabel(current)} API Key 已保存在服务器。`)
   }catch(error){
     setText(panel.querySelector('.provider-key-status'),error.message||'保存失败')
@@ -76,6 +126,8 @@ async function clearProviderKey(panel){
     const response=await nativeFetch(`/api/provider-keys/${current}`,{method:'DELETE'})
     if(!response.ok) throw new Error('删除失败')
     keyStatus[current]=false
+    const input=panel.querySelector('.secret-input-wrap input')
+    if(input?.value===SERVER_KEY) setVueInput(input,'')
     setText(panel.querySelector('.provider-key-status'),`${providerLabel(current)} API Key 已从服务器删除。`)
   }catch(error){
     setText(panel.querySelector('.provider-key-status'),error.message||'删除失败')
@@ -100,7 +152,8 @@ function applyProvider(panel){
     apiLabel.dataset.serverKeyLabel='1'
   }
   if(apiInput){
-    if(apiInput.value===SERVER_KEY) setVueInput(apiInput,'')
+    if(keyStatus[current]&&!apiInput.value) setVueInput(apiInput,SERVER_KEY)
+    if(!keyStatus[current]&&apiInput.value===SERVER_KEY) setVueInput(apiInput,'')
     const placeholder=keyStatus[current]?'已在服务器配置 · 输入新 Key 可覆盖':'请输入 API Key 并保存到服务器'
     if(apiInput.placeholder!==placeholder) apiInput.placeholder=placeholder
     if(apiInput.autocomplete!=='new-password') apiInput.autocomplete='new-password'
@@ -126,13 +179,16 @@ function applyProvider(panel){
     }
     if(fetchButton&&fetchButton.hidden) fetchButton.hidden=false
   }
+
+  const engineHead=document.querySelector('.settings-engine-section .settings-section-head h2')
+  const engineDesc=document.querySelector('.settings-engine-section .settings-section-head p')
+  setText(engineHead,'翻译引擎')
+  setText(engineDesc,'控制英文 → 中文和中文 → 英文两个阶段统一使用本地模型或远程 API。')
 }
 
 function mountTencentProvider(){
   const panel=document.querySelector('.settings-api-panel')
   if(!panel) return
-
-  localStorage.removeItem(LEGACY_BROWSER_KEY)
 
   if(!panel.querySelector('.maas-provider-switch')){
     const host=panel.querySelector('.settings-api-host')
@@ -150,7 +206,8 @@ function mountTencentProvider(){
     row.querySelectorAll('.maas-provider-button').forEach(button=>{
       button.addEventListener('click',()=>{
         localStorage.setItem(PROVIDER_KEY,button.dataset.provider)
-        setVueInput(panel.querySelector('.secret-input-wrap input'),'')
+        const input=panel.querySelector('.secret-input-wrap input')
+        setVueInput(input,keyStatus[button.dataset.provider]?SERVER_KEY:'')
         applyProvider(panel)
       })
     })
@@ -187,9 +244,54 @@ function queueMount(){
   })
 }
 
+async function handleRemoteEnglishToChinese(event){
+  if(localStorage.getItem(ENGINE_KEY)!=='remote') return
+  const button=event.target?.closest?.('button')
+  if(!button||!button.textContent?.includes('翻译为中文')) return
+  const workspace=button.closest('.polish-workspace')
+  if(!workspace) return
+
+  event.preventDefault()
+  event.stopPropagation()
+  event.stopImmediatePropagation()
+
+  if(button.dataset.remoteBusy==='1') return
+  const cards=workspace.querySelectorAll('.editor-card')
+  const sourceInput=cards[0]?.querySelector('textarea')
+  const chineseInput=cards[1]?.querySelector('textarea')
+  const text=sourceInput?.value?.trim()||''
+  if(!text){showRemoteToast('先粘贴英文原文','warning');return}
+  const model=currentRemoteModel()
+  if(!model){showRemoteToast('请先在生成设置中选择 API 模型','warning');return}
+  if(!keyStatus[provider()]){showRemoteToast(`请先保存 ${providerLabel(provider())} API Key`,'warning');return}
+
+  button.dataset.remoteBusy='1'
+  button.disabled=true
+  const oldText=button.textContent
+  button.textContent='翻译中…'
+  try{
+    const response=await nativeFetch('/api/remote/translate',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(remoteTranslatePayload(text,'en-zh',text)),
+    })
+    const data=await response.json().catch(()=>({}))
+    if(!response.ok) throw new Error(data.detail||'远程翻译失败')
+    setVueTextarea(chineseInput,data.result||'')
+    workspace.querySelector('.mobile-stage-tabs button:nth-child(2)')?.click()
+    showRemoteToast(`已通过 ${model} 翻译为中文`,'success')
+  }catch(error){
+    showRemoteToast(error.message||'远程翻译失败','error')
+  }finally{
+    delete button.dataset.remoteBusy
+    button.disabled=false
+    button.textContent=oldText
+  }
+}
+
 window.fetch=async function(input,init={}){
   const url=typeof input==='string'?input:input?.url||''
-  if((url==='/api/remote/polish'||url==='/api/remote/models')&&init?.body){
+  if((url==='/api/remote/polish'||url==='/api/remote/models'||url==='/api/remote/translate')&&init?.body){
     try{
       const body=JSON.parse(init.body)
       body.api_key=SERVER_KEY
@@ -199,6 +301,7 @@ window.fetch=async function(input,init={}){
   return nativeFetch(input,init)
 }
 
+document.addEventListener('click',handleRemoteEnglishToChinese,true)
 const observer=new MutationObserver(queueMount)
 observer.observe(document.documentElement,{childList:true,subtree:true})
 queueMicrotask(()=>{mountTencentProvider();refreshKeyStatus()})
