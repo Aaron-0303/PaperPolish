@@ -12,8 +12,10 @@ services:
       MODEL_DTYPE: ${MODEL_DTYPE:-bfloat16}
       MAX_NEW_TOKENS: ${MAX_NEW_TOKENS:-4096}
       HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      PROVIDER_SECRETS_FILE: /data/provider-secrets.json
     volumes:
       - ./models:/models
+      - ./data:/data
     ports:
       - "${API_PORT:-30480}:8000"
     shm_size: "8gb"
