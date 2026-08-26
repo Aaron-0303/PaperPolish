@@ -5,7 +5,8 @@ const TENCENT_MODEL='hy-mt2-pro'
 const SERVER_KEY='__SERVER__'
 
 let keyStatus={generic:false,tencent:false}
-let nativeFetch=window.fetch.bind(window)
+const nativeFetch=window.fetch.bind(window)
+let mountQueued=false
 
 function setVueInput(input,value){
   if(!input||input.value===value) return
@@ -14,6 +15,10 @@ function setVueInput(input,value){
   else input.value=value
   input.dispatchEvent(new Event('input',{bubbles:true}))
   input.dispatchEvent(new Event('change',{bubbles:true}))
+}
+
+function setText(node,value){
+  if(node&&node.textContent!==value) node.textContent=value
 }
 
 function provider(){
@@ -40,12 +45,11 @@ async function saveProviderKey(panel){
   const current=provider()
   const value=input?.value?.trim()||''
   if(!value||value===SERVER_KEY){
-    const status=panel.querySelector('.provider-key-status')
-    if(status) status.textContent='请输入新的 API Key 后再保存。'
+    setText(panel.querySelector('.provider-key-status'),'请输入新的 API Key 后再保存。')
     return
   }
   const button=panel.querySelector('.provider-key-save')
-  if(button){button.disabled=true;button.textContent='保存中…'}
+  if(button){button.disabled=true;setText(button,'保存中…')}
   try{
     const response=await nativeFetch(`/api/provider-keys/${current}`,{
       method:'POST',
@@ -57,13 +61,11 @@ async function saveProviderKey(panel){
     keyStatus[current]=true
     setVueInput(input,'')
     localStorage.removeItem(LEGACY_BROWSER_KEY)
-    const status=panel.querySelector('.provider-key-status')
-    if(status) status.textContent=`${providerLabel(current)} API Key 已保存在服务器。`
+    setText(panel.querySelector('.provider-key-status'),`${providerLabel(current)} API Key 已保存在服务器。`)
   }catch(error){
-    const status=panel.querySelector('.provider-key-status')
-    if(status) status.textContent=error.message||'保存失败'
+    setText(panel.querySelector('.provider-key-status'),error.message||'保存失败')
   }finally{
-    if(button){button.disabled=false;button.textContent='保存 API Key'}
+    if(button){button.disabled=false;setText(button,'保存 API Key')}
     applyProvider(panel)
   }
 }
@@ -74,11 +76,9 @@ async function clearProviderKey(panel){
     const response=await nativeFetch(`/api/provider-keys/${current}`,{method:'DELETE'})
     if(!response.ok) throw new Error('删除失败')
     keyStatus[current]=false
-    const status=panel.querySelector('.provider-key-status')
-    if(status) status.textContent=`${providerLabel(current)} API Key 已从服务器删除。`
+    setText(panel.querySelector('.provider-key-status'),`${providerLabel(current)} API Key 已从服务器删除。`)
   }catch(error){
-    const status=panel.querySelector('.provider-key-status')
-    if(status) status.textContent=error.message||'删除失败'
+    setText(panel.querySelector('.provider-key-status'),error.message||'删除失败')
   }
   applyProvider(panel)
 }
@@ -95,32 +95,36 @@ function applyProvider(panel){
   const clearButton=panel.querySelector('.provider-key-clear')
 
   buttons.forEach(button=>button.classList.toggle('active',button.dataset.provider===current))
-  if(apiLabel) apiLabel.innerHTML=`API Key <span>分别保存在服务器</span>`
+  if(apiLabel&&apiLabel.dataset.serverKeyLabel!=='1'){
+    apiLabel.replaceChildren(document.createTextNode('API Key '),Object.assign(document.createElement('span'),{textContent:'分别保存在服务器'}))
+    apiLabel.dataset.serverKeyLabel='1'
+  }
   if(apiInput){
     if(apiInput.value===SERVER_KEY) setVueInput(apiInput,'')
-    apiInput.placeholder=keyStatus[current]?'已在服务器配置 · 输入新 Key 可覆盖':'请输入 API Key 并保存到服务器'
-    apiInput.autocomplete='new-password'
+    const placeholder=keyStatus[current]?'已在服务器配置 · 输入新 Key 可覆盖':'请输入 API Key 并保存到服务器'
+    if(apiInput.placeholder!==placeholder) apiInput.placeholder=placeholder
+    if(apiInput.autocomplete!=='new-password') apiInput.autocomplete='new-password'
   }
-  if(keyStatusText) keyStatusText.textContent=keyStatus[current]?`${providerLabel(current)}：服务器已配置 API Key`:`${providerLabel(current)}：尚未配置 API Key`
-  if(clearButton) clearButton.hidden=!keyStatus[current]
+  setText(keyStatusText,keyStatus[current]?`${providerLabel(current)}：服务器已配置 API Key`:`${providerLabel(current)}：尚未配置 API Key`)
+  if(clearButton&&clearButton.hidden===keyStatus[current]) clearButton.hidden=!keyStatus[current]
 
   if(current==='tencent'){
     if(modelInput&&modelInput.value&&modelInput.value!==TENCENT_MODEL) localStorage.setItem(GENERIC_MODEL_KEY,modelInput.value)
-    if(host&&host.textContent!=='https://tokenhub.tencentmaas.com/v1') host.textContent='https://tokenhub.tencentmaas.com/v1'
+    setText(host,'https://tokenhub.tencentmaas.com/v1')
     if(modelInput){
       setVueInput(modelInput,TENCENT_MODEL)
-      modelInput.readOnly=true
-      modelInput.placeholder=TENCENT_MODEL
+      if(!modelInput.readOnly) modelInput.readOnly=true
+      if(modelInput.placeholder!==TENCENT_MODEL) modelInput.placeholder=TENCENT_MODEL
     }
-    if(fetchButton) fetchButton.hidden=true
+    if(fetchButton&&!fetchButton.hidden) fetchButton.hidden=true
   }else{
-    if(host&&host.textContent!=='https://api.gpt.ge') host.textContent='https://api.gpt.ge'
+    setText(host,'https://api.gpt.ge')
     if(modelInput){
-      modelInput.readOnly=false
+      if(modelInput.readOnly) modelInput.readOnly=false
       if(modelInput.value===TENCENT_MODEL) setVueInput(modelInput,localStorage.getItem(GENERIC_MODEL_KEY)||'')
-      modelInput.placeholder='填写或从 API 获取模型'
+      if(modelInput.placeholder!=='填写或从 API 获取模型') modelInput.placeholder='填写或从 API 获取模型'
     }
-    if(fetchButton) fetchButton.hidden=false
+    if(fetchButton&&fetchButton.hidden) fetchButton.hidden=false
   }
 }
 
@@ -146,8 +150,7 @@ function mountTencentProvider(){
     row.querySelectorAll('.maas-provider-button').forEach(button=>{
       button.addEventListener('click',()=>{
         localStorage.setItem(PROVIDER_KEY,button.dataset.provider)
-        const input=panel.querySelector('.secret-input-wrap input')
-        setVueInput(input,'')
+        setVueInput(panel.querySelector('.secret-input-wrap input'),'')
         applyProvider(panel)
       })
     })
@@ -155,21 +158,33 @@ function mountTencentProvider(){
 
   if(!panel.querySelector('.provider-key-actions')){
     const secretWrap=panel.querySelector('.secret-input-wrap')
-    const actions=document.createElement('div')
-    actions.className='provider-key-actions'
-    actions.innerHTML=`
-      <div class="provider-key-status"></div>
-      <div class="provider-key-buttons">
-        <button type="button" class="btn secondary provider-key-save">保存 API Key</button>
-        <button type="button" class="btn ghost provider-key-clear">删除已保存 Key</button>
-      </div>
-    `
-    secretWrap?.parentElement?.appendChild(actions)
-    actions.querySelector('.provider-key-save')?.addEventListener('click',()=>saveProviderKey(panel))
-    actions.querySelector('.provider-key-clear')?.addEventListener('click',()=>clearProviderKey(panel))
+    if(secretWrap){
+      const actions=document.createElement('div')
+      actions.className='provider-key-actions'
+      actions.innerHTML=`
+        <div class="provider-key-status"></div>
+        <div class="provider-key-buttons">
+          <button type="button" class="btn secondary provider-key-save">保存 API Key</button>
+          <button type="button" class="btn ghost provider-key-clear">删除已保存 Key</button>
+        </div>
+      `
+      secretWrap.parentElement?.appendChild(actions)
+      actions.querySelector('.provider-key-save')?.addEventListener('click',()=>saveProviderKey(panel))
+      actions.querySelector('.provider-key-clear')?.addEventListener('click',()=>clearProviderKey(panel))
+    }
   }
 
   applyProvider(panel)
+}
+
+function queueMount(){
+  if(mountQueued) return
+  mountQueued=true
+  requestAnimationFrame(()=>{
+    mountQueued=false
+    const panel=document.querySelector('.settings-api-panel')
+    if(panel&&(!panel.querySelector('.maas-provider-switch')||!panel.querySelector('.provider-key-actions'))) mountTencentProvider()
+  })
 }
 
 window.fetch=async function(input,init={}){
@@ -184,6 +199,6 @@ window.fetch=async function(input,init={}){
   return nativeFetch(input,init)
 }
 
-const observer=new MutationObserver(mountTencentProvider)
+const observer=new MutationObserver(queueMount)
 observer.observe(document.documentElement,{childList:true,subtree:true})
 queueMicrotask(()=>{mountTencentProvider();refreshKeyStatus()})
