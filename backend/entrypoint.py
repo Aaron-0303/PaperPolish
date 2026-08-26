@@ -23,6 +23,20 @@ class ProviderKeyRequest(BaseModel):
     api_key: str = Field(min_length=1)
 
 
+class RemoteTranslateRequest(BaseModel):
+    text: str = Field(min_length=1)
+    direction: core.Literal["en-zh", "zh-en"] if hasattr(core, "Literal") else str
+    api_key: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    mode: str = "paper"
+    terms: list[core.Term] = []
+    original_english: str = ""
+    style: str = "CVPR/IEEE concise academic style"
+    preferences: list[str] = []
+    format_type: str = "LaTeX"
+    background_text: str = ""
+
+
 def _uses_tencent_maas(model: str) -> bool:
     return model.strip().lower().startswith("hy-mt2")
 
@@ -61,7 +75,6 @@ def _server_api_key(provider: str) -> str:
 
 
 def _placeholder_tokens(text: str) -> list[str]:
-    # Preserve source order while removing duplicates.
     return list(dict.fromkeys(re.findall(r"PPPROTECT\d{4}TOKEN", text)))
 
 
@@ -115,6 +128,76 @@ def remote_polish_with_provider(req):
             core.REMOTE_API_BASE = previous_base
 
 
+def _remote_chat(model: str, api_key: str, prompt: str) -> str:
+    provider = _provider_for_model(model)
+    target_base = TENCENT_MAAS_API_ROOT if provider == "tencent" else core.REMOTE_API_BASE
+    resolved_key = _server_api_key(provider) if api_key == SERVER_API_KEY_SENTINEL else api_key.strip()
+    payload = {
+        "model": model.strip(),
+        "messages": [
+            {"role": "system", "content": "You are a rigorous bilingual academic translation assistant. Return only the requested translated text."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": core.MAX_NEW_TOKENS,
+        "temperature": 0.2,
+        "stream": False,
+    }
+    try:
+        with core.httpx.Client(timeout=120.0) as client:
+            response = client.post(f"{target_base}/v1/chat/completions", headers=core.remote_headers(resolved_key), json=payload)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=f"API 翻译失败: {response.text[:800]}")
+        data = response.json()
+        choices = data.get("choices") or []
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+        if not isinstance(content, str) or not content.strip():
+            raise HTTPException(status_code=502, detail="API 返回为空或响应格式不正确。")
+        return content.strip()
+    except HTTPException:
+        raise
+    except core.httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="API 翻译请求超时。") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"远程 API 请求失败: {exc}") from exc
+
+
+def remote_translate(req: RemoteTranslateRequest):
+    try:
+        translate_req = core.TranslateRequest(
+            text=req.text,
+            direction=req.direction,
+            mode=req.mode,
+            terms=req.terms,
+            original_english=req.original_english,
+            style=req.style,
+            preferences=req.preferences,
+            format_type=req.format_type,
+            background_text=req.background_text,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"翻译参数不正确: {exc}") from exc
+
+    protected, replacements = core.protect_text(req.text.strip(), req.terms, req.direction)
+    prompt = core.build_prompt(translate_req, protected)
+    result = _remote_chat(req.model, req.api_key, prompt)
+
+    expected = _placeholder_tokens(prompt)
+    missing = [token for token in expected if token not in result]
+    if missing:
+        token_list = "\n".join(f"- {token}" for token in expected)
+        retry_prompt = (
+            "CRITICAL: Preserve every protected placeholder token below exactly once and character-for-character. "
+            "Do not translate, split, omit, or alter them. Return only the translated text.\n\n"
+            f"Required tokens:\n{token_list}\n\nOriginal request:\n{prompt}"
+        )
+        result = _remote_chat(req.model, req.api_key, retry_prompt)
+
+    try:
+        return core.restore_text(result, replacements)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 core.generate = generate_with_placeholder_retry
 core.remote_models = remote_models_with_server_key
 core.remote_polish = remote_polish_with_provider
@@ -148,3 +231,8 @@ def delete_provider_key(provider: str):
     keys.pop(provider, None)
     _write_provider_keys(keys)
     return {"ok": True, "provider": provider, "configured": False}
+
+
+@app.post("/api/remote/translate")
+def api_remote_translate(req: RemoteTranslateRequest):
+    return {"result": remote_translate(req), "model": req.model, "engine": "remote", "direction": req.direction}
