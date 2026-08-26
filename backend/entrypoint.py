@@ -3,6 +3,7 @@ import os
 import re
 from pathlib import Path
 from threading import Lock
+from typing import Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -25,7 +26,7 @@ class ProviderKeyRequest(BaseModel):
 
 class RemoteTranslateRequest(BaseModel):
     text: str = Field(min_length=1)
-    direction: core.Literal["en-zh", "zh-en"] if hasattr(core, "Literal") else str
+    direction: Literal["en-zh", "zh-en"]
     api_key: str = Field(min_length=1)
     model: str = Field(min_length=1)
     mode: str = "paper"
