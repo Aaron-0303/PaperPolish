@@ -16,8 +16,9 @@ RUN python -m pip install --upgrade pip && \
 
 # Copy backend code
 COPY main.py .
+COPY entrypoint.py .
 
 EXPOSE 8000
 
 # Keep one worker so the GPU model is loaded only once
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "entrypoint:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
