@@ -3,7 +3,7 @@ const GENERIC_MODEL_KEY='paperpolish_generic_remote_model_v1'
 const TENCENT_MODEL='hy-mt2-pro'
 
 function setVueInput(input,value){
-  if(!input) return
+  if(!input||input.value===value) return
   const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set
   if(setter) setter.call(input,value)
   else input.value=value
@@ -26,7 +26,7 @@ function applyProvider(panel){
 
   if(current==='tencent'){
     if(modelInput&&modelInput.value&&modelInput.value!==TENCENT_MODEL) localStorage.setItem(GENERIC_MODEL_KEY,modelInput.value)
-    if(host) host.textContent='https://tokenhub.tencentmaas.com/v1'
+    if(host&&host.textContent!=='https://tokenhub.tencentmaas.com/v1') host.textContent='https://tokenhub.tencentmaas.com/v1'
     if(modelInput){
       setVueInput(modelInput,TENCENT_MODEL)
       modelInput.readOnly=true
@@ -34,7 +34,7 @@ function applyProvider(panel){
     }
     if(fetchButton) fetchButton.hidden=true
   }else{
-    if(host) host.textContent='https://api.gpt.ge'
+    if(host&&host.textContent!=='https://api.gpt.ge') host.textContent='https://api.gpt.ge'
     if(modelInput){
       modelInput.readOnly=false
       if(modelInput.value===TENCENT_MODEL){
