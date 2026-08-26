@@ -8,5 +8,7 @@ import './generation-settings.css'
 import './editor-justify.css'
 import './bulk-import.css'
 import './bulk-export.js'
+import './tencent-maas.css'
+import './tencent-maas.js'
 
 createApp(App).mount('#app')
