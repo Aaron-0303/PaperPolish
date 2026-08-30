@@ -10,5 +10,7 @@ import './bulk-import.css'
 import './bulk-export.js'
 import './tencent-maas.css'
 import './tencent-maas.js'
+import './terminology-simple.css'
+import './terminology-simple.js'
 
 createApp(App).mount('#app')
