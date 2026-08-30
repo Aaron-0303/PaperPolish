@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from pathlib import Path
 from threading import Lock
 from typing import Literal
@@ -18,7 +17,6 @@ _SECRETS_LOCK = Lock()
 _original_remote_polish = core.remote_polish
 _original_remote_models = core.remote_models
 _original_generate = core.generate
-_original_restore_text = core.restore_text
 
 
 class ProviderKeyRequest(BaseModel):
@@ -76,135 +74,27 @@ def _server_api_key(provider: str) -> str:
     return key
 
 
-def _placeholder_tokens(text: str) -> list[str]:
-    return list(dict.fromkeys(re.findall(r"PPPROTECT\d{4}TOKEN", text)))
+# Hy-MT2 already provides a terminology prompt format. Do not replace LaTeX or
+# terminology with artificial placeholder tokens; send the source text as-is.
+def protect_text_without_placeholders(text: str, terms, direction: str):
+    return text, []
 
 
-def _contains_value(text: str, value: str) -> bool:
-    if not value:
-        return True
-    if value in text:
-        return True
-    # Technical names are often returned with case changes only.
-    if value.isascii() and value.lower() in text.lower():
-        return True
-    return False
+def restore_text_without_placeholders(text: str, replacements):
+    return text.strip()
 
 
-def _replace_fuzzy_placeholder(text: str, token: str, value: str) -> tuple[str, bool]:
-    """Repair harmless formatting changes to a placeholder, e.g. inserted spaces."""
-    match = re.fullmatch(r"PPPROTECT(\d{4})TOKEN", token)
-    if not match:
-        return text, False
-    digits = match.group(1)
-    pattern = re.compile(rf"P\s*P\s*P\s*R\s*O\s*T\s*E\s*C\s*T\s*{digits}\s*T\s*O\s*K\s*E\s*N", re.I)
-    if pattern.search(text):
-        return pattern.sub(lambda _: value, text, count=1), True
-    return text, False
+def no_placeholder_instruction(source: str) -> str:
+    return ""
 
 
-def _insert_missing_value(text: str, replacements, index: int, value: str) -> str:
-    """Last-resort deterministic recovery using neighboring protected spans.
-
-    This path is only used after the model and the strict retry both failed to
-    preserve a marker. It guarantees that Locked terminology / LaTeX is never
-    silently lost and avoids surfacing an internal PPPROTECT error to the user.
-    """
-    previous_value = None
-    next_value = None
-
-    for j in range(index - 1, -1, -1):
-        candidate = replacements[j][1]
-        if candidate and _contains_value(text, candidate):
-            previous_value = candidate
-            break
-
-    for j in range(index + 1, len(replacements)):
-        candidate = replacements[j][1]
-        if candidate and _contains_value(text, candidate):
-            next_value = candidate
-            break
-
-    if next_value:
-        pos = text.lower().find(next_value.lower()) if next_value.isascii() else text.find(next_value)
-        if pos >= 0:
-            prefix = text[:pos].rstrip()
-            suffix = text[pos:].lstrip()
-            return f"{prefix} {value} {suffix}".strip()
-
-    if previous_value:
-        pos = text.lower().find(previous_value.lower()) if previous_value.isascii() else text.find(previous_value)
-        if pos >= 0:
-            end = pos + len(previous_value)
-            prefix = text[:end].rstrip()
-            suffix = text[end:].lstrip()
-            return f"{prefix} {value} {suffix}".strip()
-
-    return f"{text.rstrip()} {value}".strip()
-
-
-def restore_text_resilient(text, replacements):
-    """Restore protected spans without exposing internal placeholder failures.
-
-    Recovery order:
-    1) exact placeholder replacement;
-    2) tolerate whitespace/case corruption of the placeholder;
-    3) accept the result when the protected value is already present;
-    4) deterministically reinsert a genuinely missing protected value near its
-       neighboring protected span.
-    """
-    restored = text
-    missing = []
-
-    for index, (token, value) in enumerate(replacements):
-        if token in restored:
-            restored = restored.replace(token, value)
-            continue
-
-        restored, repaired = _replace_fuzzy_placeholder(restored, token, value)
-        if repaired:
-            continue
-
-        if _contains_value(restored, value):
-            continue
-
-        missing.append((index, token, value))
-
-    for index, _token, value in missing:
-        restored = _insert_missing_value(restored, replacements, index, value)
-
-    # Never expose any internal marker, including hallucinated markers.
-    restored = core.PLACEHOLDER_PATTERN.sub("", restored)
-    return re.sub(r"[ \t]{2,}", " ", restored).strip()
-
-
-def generate_with_placeholder_retry(prompt: str) -> str:
-    """Retry once with a strict instruction if Hy-MT2 drops protected tokens."""
-    result = _original_generate(prompt)
-    expected = _placeholder_tokens(prompt)
-    if not expected:
-        return result
-
-    missing = [token for token in expected if token not in result]
-    if not missing:
-        return result
-
-    token_list = "\n".join(f"- {token}" for token in expected)
-    strict_prompt = f"""CRITICAL FORMAT REQUIREMENT
-The source text contains protected placeholder tokens. They are immutable text markers, not words to translate.
-You MUST output every token listed below exactly once, character-for-character, and keep each token in the same logical position as in the source sentence.
-Do not translate, reformat, split, merge, omit, or invent any placeholder token.
-If a placeholder stands for a technical term or LaTeX fragment, leave the placeholder itself untouched; PaperPolish will restore the original value after generation.
-
-Required placeholder tokens:
-{token_list}
-
-Return only the final translated text, with no explanation.
-
-ORIGINAL TRANSLATION REQUEST:
-{prompt}
-"""
-    return _original_generate(strict_prompt)
+def official_terminology_lines(terms, direction: str) -> str:
+    pairs = [(t.english.strip(), t.chinese.strip()) for t in terms if t.english.strip() and t.chinese.strip()]
+    if not pairs:
+        return ""
+    if direction == "en-zh":
+        return "参考下面的翻译：\n" + "\n".join(f"{en} 翻译成 {zh}" for en, zh in pairs) + "\n"
+    return "Reference the following translations:\n" + "\n".join(f"{zh} translates to {en}" for en, zh in pairs) + "\n\n"
 
 
 def remote_models_with_server_key(api_key: str):
@@ -213,7 +103,6 @@ def remote_models_with_server_key(api_key: str):
 
 
 def remote_polish_with_provider(req):
-    """Use a different server-stored API key for each remote provider."""
     provider = _provider_for_model(req.model)
     target_base = TENCENT_MAAS_API_ROOT if provider == "tencent" else core.REMOTE_API_BASE
     if req.api_key == SERVER_API_KEY_SENTINEL:
@@ -277,26 +166,17 @@ def remote_translate(req: RemoteTranslateRequest):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"翻译参数不正确: {exc}") from exc
 
-    protected, replacements = core.protect_text(req.text.strip(), req.terms, req.direction)
-    prompt = core.build_prompt(translate_req, protected)
-    result = _remote_chat(req.model, req.api_key, prompt)
-
-    expected = _placeholder_tokens(prompt)
-    missing = [token for token in expected if token not in result]
-    if missing:
-        token_list = "\n".join(f"- {token}" for token in expected)
-        retry_prompt = (
-            "CRITICAL: Preserve every protected placeholder token below exactly once and character-for-character. "
-            "Do not translate, split, omit, or alter them. Return only the translated text.\n\n"
-            f"Required tokens:\n{token_list}\n\nOriginal request:\n{prompt}"
-        )
-        result = _remote_chat(req.model, req.api_key, retry_prompt)
-
-    return core.restore_text(result, replacements)
+    prompt = core.build_prompt(translate_req, req.text.strip())
+    return _remote_chat(req.model, req.api_key, prompt)
 
 
-core.restore_text = restore_text_resilient
-core.generate = generate_with_placeholder_retry
+# Replace the old placeholder layer globally. Existing stored terminology may
+# still contain a legacy type field, but the backend intentionally ignores it.
+core.protect_text = protect_text_without_placeholders
+core.restore_text = restore_text_without_placeholders
+core.placeholder_instruction = no_placeholder_instruction
+core.terminology_lines = official_terminology_lines
+core.generate = _original_generate
 core.remote_models = remote_models_with_server_key
 core.remote_polish = remote_polish_with_provider
 app = core.app
